@@ -34,7 +34,7 @@ import { stageSignals } from "./signal-tracker.js";
 import { getWeightsSummary } from "./signal-weights.js";
 import { bootstrapHiveMind, ensureAgentId, getHiveMindPullMode, isHiveMindEnabled, pullHiveMindLessons, pullHiveMindPresets, registerHiveMindAgent, startHiveMindBackgroundSync } from "./hivemind.js";
 import { appendDecision } from "./decision-log.js";
-import { checkEvilPandaIndicatorExit, isEvilPandaEnabled } from "./evil-panda.js";
+import { checkEvilPandaIndicatorExit, getEvilPandaTokenRejectReason, isEvilPandaEnabled } from "./evil-panda.js";
 
 import { REPO_ROOT, repoPath } from "./repo-root.js";
 
@@ -466,6 +466,14 @@ export async function runScreeningCycle({ silent = false } = {}) {
         filteredOut.push({ name: pool.name, reason: `bot holders ${botPct}% > ${maxBotHoldersPct}%` });
         return false;
       }
+      // Evil Panda coin selection (24h volume, picture, fees, top10) — enforced for every
+      // candidate, not only the lone-candidate path.
+      const epReason = getEvilPandaTokenRejectReason(ti);
+      if (epReason) {
+        log("screening", `EP filter: dropped ${pool.name} — ${epReason}`);
+        filteredOut.push({ name: pool.name, reason: epReason });
+        return false;
+      }
       return true;
     });
 
@@ -539,7 +547,7 @@ export async function runScreeningCycle({ silent = false } = {}) {
       const block = [
         `POOL: ${pool.name} (${pool.pool})`,
         `  metrics: bin_step=${pool.bin_step}, fee_pct=${pool.fee_pct}%, fee_tvl=${pool.fee_active_tvl_ratio}, vol=$${pool.volume_window}, tvl=$${pool.tvl ?? pool.active_tvl}, volatility_${pool.volatility_timeframe || "30m"}=${pool.volatility}, mcap=$${pool.mcap}, organic=${pool.organic_score}${pool.token_age_hours != null ? `, age=${pool.token_age_hours}h` : ""}`,
-        `  audit: top10=${top10Pct}%, bots=${botPct}%, fees=${feesSol}SOL${launchpad ? `, launchpad=${launchpad}` : ""}`,
+        `  audit: top10=${top10Pct}%, bots=${botPct}%, fees=${feesSol}SOL${ti?.volume_24h != null ? `, vol24h=$${ti.volume_24h}` : ""}${launchpad ? `, launchpad=${launchpad}` : ""}`,
         pvpLine,
         `  smart_wallets: ${sw?.in_pool?.length ?? 0} present${sw?.in_pool?.length ? ` → CONFIDENCE BOOST (${sw.in_pool.map(w => w.name).join(", ")})` : ""}`,
         activeBin != null ? `  active_bin: ${activeBin}` : null,
@@ -576,7 +584,7 @@ SCREENING CYCLE
 ${strategyBlock}
 Positions: ${prePositions.total_positions}/${config.risk.maxPositions} | SOL: ${currentBalance.sol.toFixed(3)} | Deploy: ${deployAmount} SOL
 
-PRE-LOADED CANDIDATES (${passing.length} pools):
+PRE-LOADED CANDIDATES (${passing.length} pools${isEvilPandaEnabled() && config.evilPanda.sortNewestFirst ? ", listed newest token first — prefer newer tokens when quality is comparable" : ""}):
 ${candidateBlocks.join("\n\n")}
 
 STEPS:
@@ -1325,6 +1333,22 @@ async function deployLatestCandidate(index) {
   const candidate = _latestCandidates[index];
   if (!candidate) {
     throw new Error("Invalid candidate index. Run /screen first.");
+  }
+  if (isEvilPandaEnabled()) {
+    const mint = candidate.base?.mint || candidate.base_mint || null;
+    const ti = mint ? await getTokenInfo({ query: mint }).then((r) => r?.results?.[0] ?? null).catch(() => null) : null;
+    const epReason = getEvilPandaTokenRejectReason(ti);
+    if (epReason) {
+      appendDecision({
+        type: "no_deploy",
+        actor: "SCREENER",
+        summary: "Cached candidate failed Evil Panda coin selection",
+        reason: epReason,
+        pool: candidate.pool,
+        pool_name: candidate.name,
+      });
+      throw new Error(`NO DEPLOY: ${candidate.name} — ${epReason}`);
+    }
   }
   if (_latestCandidates.length === 1) {
     const mint = candidate.base?.mint || candidate.base_mint || null;

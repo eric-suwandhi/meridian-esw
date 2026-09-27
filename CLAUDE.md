@@ -404,8 +404,10 @@ Standalone process — `cd discord-listener && npm install && npm start`. Shares
 |---|---|---|
 | Range | Always `-epDownsidePct` (90%) single-side SOL, `bins_above=0`; any `bins_below` from the LLM is ignored. | `executor.js runSafetyChecks` + `dlmm.js deployPosition` |
 | Bin arrays | If the -90% range needs uninitialized bin arrays → deploy refused (no rent paid) and pool cooldown `epBinArrayCooldownHours` (2h). | `dlmm.js` |
-| Gates | Block `volatility < epMinVolatility` (1) and base fee `fee_pct < epMinBaseFeePct` (1%). | `screening.js getTopCandidates` + `executor.js validateDeployPoolThresholds` |
-| Entry | `epEntryPreset` (`supertrend_break`) on `epEntryInterval` (5m), runs even when `chartIndicators.enabled=false`. | `screening.js` |
+| Pool gates | Block `volatility < epMinVolatility` (1), base fee `fee_pct < epMinBaseFeePct` (1%), bin step not in `epAllowedBinSteps` (80/100/125), mcap < `epMinMcap` (250k; also raises the discovery API mcap floor). | `evil-panda.js getEvilPandaPoolRejectReason` ← `screening.js getTopCandidates` + `executor.js validateDeployPoolThresholds` |
+| Token gates | After recon, for **every** candidate (not just the lone one): token 24h volume ≥ `epMin24hVolumeUsd` ($1M, Jupiter `stats24h`), has picture (`epRequireIcon`), fees ≥ `epMinTokenFeesSol` (30 SOL), top10 ≤ `epMaxTop10Pct` (30%). Missing data rejects. | `evil-panda.js getEvilPandaTokenRejectReason` ← `index.js runScreeningCycle` + `deployLatestCandidate` |
+| Order | Candidates sorted newest token first (`epSortNewestFirst`), score breaks ties. | `screening.js getTopCandidates` |
+| Entry | `epEntryPreset` (`supertrend_break`: flip or close above bullish Supertrend) on `epEntryInterval` (15m), runs even when `chartIndicators.enabled=false`. | `screening.js` |
 | Exits | Trailing TP (default trigger 10 / drop 15) and SL (default -30) via existing state/close rules. Fixed TP (rule 2) and low-yield (rule 5) are skipped. Plus 15m indicator exits at any PnL: close ≥ upper BB + RSI(2) ≥ `epExitRsiLevel` (`EP_BB_RSI`), or RSI(2) ≥ 90 (`EP_RSI`). | `index.js getDeterministicCloseRule`, management cycle, PnL poller → `checkEvilPandaIndicatorExit` |
 
 EP defaults for `stopLossPct` / `trailingTriggerPct` / `trailingDropPct` only apply when those keys are absent from `user-config.json`. Exit indicator payloads are cached per mint for `epExitCheckSec` (60s); an indicator API failure never closes a position.

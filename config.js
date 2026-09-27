@@ -275,12 +275,20 @@ export const config = {
     minVolatility:      Number(u.epMinVolatility ?? 1),         // block pools with volatility below this
     minBaseFeePct:      Number(u.epMinBaseFeePct ?? 1),         // block pools with base fee below this (%)
     entryPreset:        u.epEntryPreset ?? "supertrend_break",
-    entryInterval:      u.epEntryInterval ?? "5_MINUTE",
+    entryInterval:      u.epEntryInterval ?? "15_MINUTE",
     exitInterval:       u.epExitInterval ?? "15_MINUTE",
     exitRsiLevel:       Number(u.epExitRsiLevel ?? 90),         // RSI(2) level for BB+RSI and RSI exits
     exitCheckSec:       Number(u.epExitCheckSec ?? 60),         // cache TTL for exit indicator fetches
     indicatorExitsAnyPnl: u.epIndicatorExitsAnyPnl ?? true,     // fire indicator exits even at negative PnL
     binArrayCooldownHours: Number(u.epBinArrayCooldownHours ?? 2), // pool cooldown when -X% range needs uninitialized bin arrays
+    // Coin selection
+    minMcap:            Number(u.epMinMcap ?? 250_000),
+    min24hVolumeUsd:    Number(u.epMin24hVolumeUsd ?? 1_000_000), // token 24h volume across all pools (Jupiter)
+    requireIcon:        u.epRequireIcon ?? true,                  // skip tokens without a picture
+    minTokenFeesSol:    Number(u.epMinTokenFeesSol ?? 30),
+    maxTop10Pct:        Number(u.epMaxTop10Pct ?? 30),
+    allowedBinSteps:    Array.isArray(u.epAllowedBinSteps) ? u.epAllowedBinSteps.map(Number) : [80, 100, 125],
+    sortNewestFirst:    u.epSortNewestFirst ?? true,
   },
 };
 

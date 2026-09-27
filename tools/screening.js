@@ -4,7 +4,7 @@ import { isDevBlocked, getBlockedDevs } from "../dev-blocklist.js";
 import { log } from "../logger.js";
 import { isBaseMintOnCooldown, isPoolOnCooldown } from "../pool-memory.js";
 import { confirmIndicatorPreset } from "./chart-indicators.js";
-import { getEvilPandaPoolRejectReason, isEvilPandaEnabled } from "../evil-panda.js";
+import { compareNewestFirst, getEvilPandaPoolRejectReason, isEvilPandaEnabled } from "../evil-panda.js";
 import { getAgentMeridianBase, getAgentMeridianHeaders } from "./agent-meridian.js";
 
 const DATAPI_JUP = "https://datapi.jup.ag/v1";
@@ -441,7 +441,7 @@ export async function discoverPools({
     s.excludeHighSupplyConcentration ? "base_token_has_high_supply_concentration=false" : null,
     "base_token_has_high_single_ownership=false",
     "pool_type=dlmm",
-    `base_token_market_cap>=${s.minMcap}`,
+    `base_token_market_cap>=${isEvilPandaEnabled() ? Math.max(Number(s.minMcap) || 0, config.evilPanda.minMcap) : s.minMcap}`,
     `base_token_market_cap<=${s.maxMcap}`,
     `base_token_holders>=${s.minHolders}`,
     `volume>=${s.minVolume}`,
@@ -653,7 +653,10 @@ export async function getTopCandidates({ limit = 10 } = {}) {
       }
       return true;
     })
-    .sort((a, b) => scoreCandidate(b) - scoreCandidate(a))
+    // Evil Panda: newest token first (score breaks ties); otherwise score order.
+    .sort((a, b) =>
+      (isEvilPandaEnabled() && config.evilPanda.sortNewestFirst ? compareNewestFirst(a, b) : 0) ||
+      scoreCandidate(b) - scoreCandidate(a))
     .slice(0, limit);
 
   if (config.screening.avoidPvpSymbols && eligible.length > 0) {

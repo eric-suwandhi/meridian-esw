@@ -226,7 +226,10 @@ function normalizeConfigValue(key, value) {
     "requireAllIntervals",
     "evilPandaEnabled",
     "epIndicatorExitsAnyPnl",
+    "epRequireIcon",
+    "epSortNewestFirst",
   ]);
+  const numberArrayKeys = new Set(["epAllowedBinSteps"]);
   const arrayKeys = new Set(["allowedLaunchpads", "blockedLaunchpads", "indicatorIntervals"]);
   const stringKeys = new Set([
     "timeframe",
@@ -254,6 +257,10 @@ function normalizeConfigValue(key, value) {
   ]);
   if (value === null) return null;
   if (booleanKeys.has(key)) return coerceBoolean(value, key);
+  if (numberArrayKeys.has(key)) {
+    if (!Array.isArray(value)) throw new Error(`${key} must be an array of numbers`);
+    return value.map((entry) => coerceFiniteNumber(entry, key));
+  }
   if (arrayKeys.has(key)) return coerceStringArray(value, key);
   if (stringKeys.has(key)) return coerceString(value, key);
   return coerceFiniteNumber(value, key);
@@ -485,6 +492,13 @@ const toolMap = {
       epExitCheckSec: ["evilPanda", "exitCheckSec"],
       epIndicatorExitsAnyPnl: ["evilPanda", "indicatorExitsAnyPnl"],
       epBinArrayCooldownHours: ["evilPanda", "binArrayCooldownHours"],
+      epMinMcap: ["evilPanda", "minMcap"],
+      epMin24hVolumeUsd: ["evilPanda", "min24hVolumeUsd"],
+      epRequireIcon: ["evilPanda", "requireIcon"],
+      epMinTokenFeesSol: ["evilPanda", "minTokenFeesSol"],
+      epMaxTop10Pct: ["evilPanda", "maxTop10Pct"],
+      epAllowedBinSteps: ["evilPanda", "allowedBinSteps"],
+      epSortNewestFirst: ["evilPanda", "sortNewestFirst"],
     };
 
     const applied = {};
