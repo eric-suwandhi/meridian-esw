@@ -99,6 +99,12 @@ export const config = {
     maxBotHoldersPct:  u.maxBotHoldersPct  ?? 30,  // max bot holder addresses % (Jupiter audit)
     maxTop10Pct:       u.maxTop10Pct       ?? 60,  // max top 10 holders concentration
     loneCandidateMinDegen: u.loneCandidateMinDegen ?? 50, // degen score that lets a SOLO candidate deploy without a narrative
+    // Screening decision: "deterministic" scores + deploys in code (deterministic-screener.js); "llm" lets the LLM pick.
+    screeningMode:        u.screeningMode ?? (evilPandaEnabled ? "deterministic" : "llm"),
+    detMinScore:          Number(u.detMinScore ?? 50),         // min 0..100 score to deploy
+    detFreshAgeHours:     Number(u.detFreshAgeHours ?? 72),    // token age where the freshness sub-score hits 0
+    detMaxDeployAttempts: Number(u.detMaxDeployAttempts ?? 2), // qualifying candidates to try if a deploy fails
+    detScoreWeights:      u.detScoreWeights && typeof u.detScoreWeights === "object" ? u.detScoreWeights : {},
     allowedLaunchpads: u.allowedLaunchpads ?? [],  // allow-list launchpads, [] = no allow-list
     blockedLaunchpads:  u.blockedLaunchpads  ?? [],  // e.g. ["letsbonk.fun", "pump.fun"]
     minTokenAgeHours:   u.minTokenAgeHours   ?? null, // null = no minimum

@@ -94,6 +94,22 @@
   "gmgnFeeSource": "gmgn",
   "gmgnApiKey": "",
 
+  "screeningMode": "deterministic",
+  "detMinScore": 50,
+  "detFreshAgeHours": 72,
+  "detMaxDeployAttempts": 2,
+  "detScoreWeights": {
+    "degen": 35,
+    "fresh": 20,
+    "vol24h": 15,
+    "fees": 10,
+    "holders": 10,
+    "smartWallets": 10,
+    "narrative": 5,
+    "pvpPenalty": 15,
+    "memoryPenalty": 10
+  },
+
   "evilPandaEnabled": true,
   "epDownsidePct": 90,
   "epMinVolatility": 1,

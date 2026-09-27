@@ -254,9 +254,11 @@ function normalizeConfigValue(key, value) {
     "epEntryPreset",
     "epEntryInterval",
     "epExitInterval",
+    "screeningMode",
   ]);
   if (value === null) return null;
   if (booleanKeys.has(key)) return coerceBoolean(value, key);
+  if (key === "detScoreWeights") return typeof value === "string" ? JSON.parse(value) : value; // validated by caller
   if (numberArrayKeys.has(key)) {
     if (!Array.isArray(value)) throw new Error(`${key} must be an array of numbers`);
     return value.map((entry) => coerceFiniteNumber(entry, key));
@@ -393,6 +395,11 @@ const toolMap = {
       maxTokenAgeHours: ["screening", "maxTokenAgeHours"],
       minFeePerTvl24h: ["management", "minFeePerTvl24h"],
       loneCandidateMinDegen: ["screening", "loneCandidateMinDegen"],
+      screeningMode: ["screening", "screeningMode"],
+      detMinScore: ["screening", "detMinScore"],
+      detFreshAgeHours: ["screening", "detFreshAgeHours"],
+      detMaxDeployAttempts: ["screening", "detMaxDeployAttempts"],
+      detScoreWeights: ["screening", "detScoreWeights"],
       // management
       minClaimAmount: ["management", "minClaimAmount"],
       autoSwapAfterClaim: ["management", "autoSwapAfterClaim"],
@@ -527,6 +534,20 @@ const toolMap = {
           normalizedVal = Math.max(MIN_SAFE_BINS_BELOW, Math.round(numericVal));
         } else {
           normalizedVal = normalizeConfigValue(match[0], val);
+        }
+        if (match[0] === "screeningMode") {
+          normalizedVal = String(normalizedVal).toLowerCase();
+          if (normalizedVal !== "deterministic" && normalizedVal !== "llm") {
+            throw new Error("screeningMode must be deterministic or llm");
+          }
+        }
+        if (match[0] === "detScoreWeights") {
+          if (!normalizedVal || typeof normalizedVal !== "object" || Array.isArray(normalizedVal)) {
+            throw new Error("detScoreWeights must be an object of numbers");
+          }
+          normalizedVal = Object.fromEntries(
+            Object.entries(normalizedVal).map(([k, v]) => [k, coerceFiniteNumber(v, `detScoreWeights.${k}`)]),
+          );
         }
         if (match[0] === "epDownsidePct" && !(normalizedVal > 0 && normalizedVal < 100)) {
           throw new Error("epDownsidePct must be between 0 and 100 (exclusive)");

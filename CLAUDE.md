@@ -414,6 +414,29 @@ EP defaults for `stopLossPct` / `trailingTriggerPct` / `trailingDropPct` only ap
 
 ---
 
+## Deterministic screening (`deterministic-screener.js`)
+
+`screeningMode: "deterministic"` (default when EP is on; `"llm"` otherwise, toggle in `/settings` → Screen) replaces the LLM pick in `runScreeningCycle`. Everything up to the post-recon `passing` list is shared with the LLM path; then `runDeterministicDeploy` (`index.js`) ranks, deploys, and builds the report in code — `agentLoop` is never called.
+
+Score 0–100 = weighted sub-scores (0–1) + bonus − penalties, clamped. Weights override via `detScoreWeights`.
+
+| Part | Input | Sub-score | Default |
+|---|---|---|---:|
+| `degen` | `degenScore(pool, config.opportunity)` | /100 | 35 |
+| `fresh` | `token_age_hours` | 1 − age/`detFreshAgeHours` (72) | 20 |
+| `vol24h` | `ti.volume_24h` | log $1M→$10M | 15 |
+| `fees` | `ti.global_fees_sol` | log 30→300 SOL | 10 |
+| `holders` | `ti.audit.top_holders_pct` | (30 − top10)/30 | 10 |
+| `smartWallets` | `sw.in_pool` | any present | 10 |
+| `narrative` | `n.narrative` | bonus | +5 |
+| `pvp` / `memory` | `is_pvp` / ≥2 past deploys with avg PnL < 0 | penalty | −15 / −10 |
+
+- Deploys the best candidate with score ≥ `detMinScore` (50) via `deployScoredCandidate` → `executeTool("deploy_position")` (full safety pipeline). On failure (incl. `blocked`) tries the next qualifying candidate, up to `detMaxDeployAttempts` (2). Otherwise `no_deploy` decision with every candidate's breakdown.
+- Ties: newer token, then higher degen. The lone-candidate rule is skipped (min score replaces it).
+- LLM mode still gets a `det_score …` line per candidate block.
+
+---
+
 ## Known issues / tech debt (verified by reading the code)
 
 - **`lessons.js evolveThresholds()`** evolves `minOrganic` and `minFeeActiveTvlRatio` only.

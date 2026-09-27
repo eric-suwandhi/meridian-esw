@@ -35,6 +35,7 @@ import { getWeightsSummary } from "./signal-weights.js";
 import { bootstrapHiveMind, ensureAgentId, getHiveMindPullMode, isHiveMindEnabled, pullHiveMindLessons, pullHiveMindPresets, registerHiveMindAgent, startHiveMindBackgroundSync } from "./hivemind.js";
 import { appendDecision } from "./decision-log.js";
 import { checkEvilPandaIndicatorExit, getEvilPandaTokenRejectReason, isEvilPandaEnabled } from "./evil-panda.js";
+import { buildDeployedReport, buildNoDeployReport, formatScoreBreakdown, rankCandidates, scoreDeployCandidate } from "./deterministic-screener.js";
 
 import { REPO_ROOT, repoPath } from "./repo-root.js";
 
@@ -409,7 +410,7 @@ export async function runScreeningCycle({ silent = false } = {}) {
     liveMessage = await createLiveMessage("🔍 Screening Cycle", "Scanning candidates...");
   }
   timers.screeningLastRun = Date.now();
-  log("cron", `Starting screening cycle [model: ${config.llm.screeningModel}]`);
+  log("cron", `Starting screening cycle [${config.screening.screeningMode === "deterministic" ? "deterministic scoring" : `model: ${config.llm.screeningModel}`}]`);
   try {
     // Reuse pre-fetched balance — no extra RPC call needed
     const currentBalance = preBalance;
@@ -495,6 +496,13 @@ export async function runScreeningCycle({ silent = false } = {}) {
       return screenReport;
     }
 
+    // Deterministic mode: score in code, deploy the best qualifying candidate, no LLM.
+    // The min score replaces the lone-candidate conviction rule.
+    if (config.screening.screeningMode === "deterministic") {
+      screenReport = await runDeterministicDeploy({ passing, deployAmount, liveMessage });
+      return screenReport;
+    }
+
     if (passing.length === 1) {
       const skipReason = getLoneCandidateSkipReason(passing[0]);
       if (skipReason) {
@@ -554,23 +562,11 @@ export async function runScreeningCycle({ silent = false } = {}) {
         priceChange != null ? `  1h: price${priceChange >= 0 ? "+" : ""}${priceChange}%, net_buyers=${netBuyers ?? "?"}` : null,
         n?.narrative ? `  narrative_untrusted: ${sanitizeUntrustedPromptText(n.narrative, 500)}` : `  narrative_untrusted: none`,
         mem ? `  memory_untrusted: ${sanitizeUntrustedPromptText(mem, 500)}` : null,
+        `  det_${formatScoreBreakdown(scoreDeployCandidate({ pool, sw, n, ti }))}`,
       ].filter(Boolean).join("\n");
 
       // Stage signals for Darwinian weighting — captured before LLM decides
-      if (config.darwin?.enabled) {
-        const baseMint = pool.base?.mint || pool.base_mint || ti?.mint || null;
-        stageSignals(pool.pool, {
-          base_mint:             baseMint,
-          organic_score:         pool.organic_score         ?? null,
-          fee_tvl_ratio:         pool.fee_active_tvl_ratio  ?? null,
-          volume:                pool.volume_window         ?? null,
-          mcap:                  pool.mcap                  ?? null,
-          holder_count:          ti?.holders                ?? null,
-          smart_wallets_present: (sw?.in_pool?.length ?? 0) > 0,
-          narrative_quality:     n?.narrative ? "present" : "absent",
-          volatility:            pool.volatility            ?? null,
-        });
-      }
+      if (config.darwin?.enabled) stageCandidateSignals({ pool, sw, n, ti });
 
       return block;
     });
@@ -1072,6 +1068,8 @@ function settingValue(key) {
     rsiLength: config.indicators.rsiLength,
     indicatorIntervals: config.indicators.intervals,
     requireAllIntervals: config.indicators.requireAllIntervals,
+    screeningMode: config.screening.screeningMode,
+    detMinScore: config.screening.detMinScore,
   };
   return values[key];
 }
@@ -1109,6 +1107,7 @@ function renderSettingsMenu(page = "main") {
     `Strategy: ${config.strategy.strategy} | bins ${config.strategy.minBinsBelow}-${config.strategy.maxBinsBelow} | deploy ${config.management.deployAmountSol} SOL`,
     `TP/SL: ${config.management.takeProfitPct}% / ${config.management.stopLossPct}% | trailing ${config.management.trailingTakeProfit ? "on" : "off"}`,
     `Indicators: ${config.indicators.enabled ? "on" : "off"} | entry ${config.indicators.entryPreset} | ${fmtSettingValue(config.indicators.intervals)}`,
+    `Screening: ${config.screening.screeningMode}${config.screening.screeningMode === "deterministic" ? ` (min score ${config.screening.detMinScore})` : ""}`,
   ].join("\n");
 
   const nav = [
@@ -1147,6 +1146,11 @@ function renderSettingsMenu(page = "main") {
   } else if (page === "screen") {
     rows = [
       [toggleButton("useDiscordSignals", "Discord signals"), toggleButton("blockPvpSymbols", "PVP hard block")],
+      [
+        settingButton(`${config.screening.screeningMode === "deterministic" ? "✅ " : ""}Pick: scored`, "cfg:set:screeningMode:deterministic"),
+        settingButton(`${config.screening.screeningMode === "llm" ? "✅ " : ""}Pick: LLM`, "cfg:set:screeningMode:llm"),
+      ],
+      stepButtons("detMinScore", "Min score", 5, { digits: 0 }),
       [
         settingButton(`Strategy: spot`, "cfg:set:strategy:spot"),
         settingButton(`Strategy: bid_ask`, "cfg:set:strategy:bid_ask"),
@@ -1253,6 +1257,7 @@ async function applySettingsMenuCallback(msg) {
     value = Number((current + delta).toFixed(4));
     if (key === "maxPositions") value = Math.max(1, Math.round(value));
     if (key === "rsiLength") value = Math.max(2, Math.round(value));
+    if (key === "detMinScore") value = Math.min(100, Math.max(0, Math.round(value)));
     if (key === "repeatDeployCooldownTriggerCount") value = Math.max(1, Math.round(value));
     if (key === "repeatDeployCooldownHours") value = Math.max(0, Math.round(value));
     if (key === "repeatDeployCooldownMinFeeEarnedPct") value = Math.max(0, value);
@@ -1275,7 +1280,7 @@ async function applySettingsMenuCallback(msg) {
   }
   page = key.startsWith("indicator") || key === "chartIndicatorsEnabled" || key === "rsiLength" || key === "requireAllIntervals"
     ? "indicators"
-    : ["useDiscordSignals", "blockPvpSymbols", "strategy", "minBinsBelow", "maxBinsBelow", "defaultBinsBelow", "managementIntervalMin", "screeningIntervalMin"].includes(key)
+    : ["useDiscordSignals", "blockPvpSymbols", "screeningMode", "detMinScore", "strategy", "minBinsBelow", "maxBinsBelow", "defaultBinsBelow", "managementIntervalMin", "screeningIntervalMin"].includes(key)
       ? "screen"
       : "risk";
   await answerCallbackQuery(msg.callbackQueryId, `Updated ${key}`);
@@ -1317,7 +1322,7 @@ async function runDeterministicScreen(limit = 5) {
     const lines = candidates.map((pool, i) => {
       const feeTvl = pool.fee_active_tvl_ratio ?? pool.fee_tvl_ratio ?? "?";
       const vol = pool.volume_window ?? pool.volume_24h ?? "?";
-      return `${i + 1}. ${pool.name} | ${pool.pool}\n   fee/aTVL ${feeTvl}% | vol $${vol} | organic ${pool.organic_score ?? "?"}`;
+      return `${i + 1}. ${pool.name} | ${pool.pool}\n   fee/aTVL ${feeTvl}% | vol $${vol} | organic ${pool.organic_score ?? "?"} | degen ${degenScore(pool, config.opportunity).toFixed(0)} | age ${pool.token_age_hours ?? "?"}h`;
     });
     return `Top candidates (${candidates.length})\n\n${lines.join("\n")}`;
   }
@@ -1377,25 +1382,8 @@ async function deployLatestCandidate(index) {
     }
   }
   const deployAmount = computeDeployAmount((await getWalletBalances()).sol);
-  const binsBelow = computeBinsBelow(candidate.volatility);
-  const result = await executeTool("deploy_position", {
-    pool_address: candidate.pool,
-    amount_y: deployAmount,
-    strategy: config.strategy.strategy,
-    bins_below: binsBelow,
-    bins_above: 0,
-    pool_name: candidate.name,
-    base_mint: candidate.base?.mint || candidate.base_mint || null,
-    bin_step: candidate.bin_step,
-    base_fee: candidate.base_fee,
-    volatility: candidate.volatility,
-    fee_tvl_ratio: candidate.fee_active_tvl_ratio ?? candidate.fee_tvl_ratio,
-    organic_score: candidate.organic_score,
-    initial_value_usd: candidate.tvl ?? candidate.active_tvl ?? null,
-  });
-  if (result?.success === false || result?.error) {
-    throw new Error(result.error || "Deploy failed");
-  }
+  const { ok, result, error, binsBelow } = await deployScoredCandidate(candidate, deployAmount);
+  if (!ok) throw new Error(error);
   return { result, candidate, deployAmount, binsBelow };
 }
 
@@ -1710,6 +1698,97 @@ async function telegramHandler(msg) {
 function fmtPct(value) {
   const n = Number(value);
   return Number.isFinite(n) ? `${n.toFixed(2)}%` : "?";
+}
+
+function stageCandidateSignals({ pool, sw, n, ti }) {
+  const baseMint = pool.base?.mint || pool.base_mint || ti?.mint || null;
+  stageSignals(pool.pool, {
+    base_mint:             baseMint,
+    organic_score:         pool.organic_score         ?? null,
+    fee_tvl_ratio:         pool.fee_active_tvl_ratio  ?? null,
+    volume:                pool.volume_window         ?? null,
+    mcap:                  pool.mcap                  ?? null,
+    holder_count:          ti?.holders                ?? null,
+    smart_wallets_present: (sw?.in_pool?.length ?? 0) > 0,
+    narrative_quality:     n?.narrative ? "present" : "absent",
+    volatility:            pool.volatility            ?? null,
+  });
+}
+
+/**
+ * Deploy one candidate through the executeTool safety pipeline.
+ * Returns { ok, result, error, binsBelow } — a safety block counts as a failure.
+ */
+async function deployScoredCandidate(candidate, deployAmount) {
+  // EP mode forces the -X% range in runSafetyChecks/deployPosition; bins_below is ignored there.
+  const binsBelow = isEvilPandaEnabled() ? undefined : computeBinsBelow(candidate.volatility);
+  const result = await executeTool("deploy_position", {
+    pool_address: candidate.pool,
+    amount_y: deployAmount,
+    strategy: config.strategy.strategy,
+    bins_below: binsBelow,
+    bins_above: 0,
+    pool_name: candidate.name,
+    base_mint: candidate.base?.mint || candidate.base_mint || null,
+    bin_step: candidate.bin_step,
+    base_fee: candidate.base_fee ?? candidate.fee_pct,
+    volatility: candidate.volatility,
+    fee_tvl_ratio: candidate.fee_active_tvl_ratio ?? candidate.fee_tvl_ratio,
+    organic_score: candidate.organic_score,
+    initial_value_usd: candidate.tvl ?? candidate.active_tvl ?? null,
+  });
+  const failed = !result || result.success === false || !!result.error || !!result.blocked;
+  return {
+    ok: !failed,
+    result,
+    error: failed ? (result?.error || result?.reason || "Deploy failed") : null,
+    binsBelow,
+  };
+}
+
+/**
+ * Deterministic screening decision: rank recon'd candidates, deploy the best one with
+ * score >= detMinScore (falling back to the next qualifying one on deploy failure),
+ * and return a Telegram report. No LLM involved.
+ */
+async function runDeterministicDeploy({ passing, deployAmount, liveMessage }) {
+  const minScore = Number(config.screening.detMinScore ?? 50);
+  const ranked = rankCandidates(passing);
+  log("screening", `Deterministic scores: ${ranked.map((c) => `${c.pool.name}=${c.score}`).join(", ")}`);
+
+  const qualifying = ranked.filter((c) => c.score >= minScore);
+  const maxAttempts = Math.max(1, Math.round(Number(config.screening.detMaxDeployAttempts ?? 2)));
+  const failures = [];
+
+  for (const cand of qualifying.slice(0, maxAttempts)) {
+    if (config.darwin?.enabled) stageCandidateSignals(cand);
+    await liveMessage?.toolStart("deploy_position");
+    let outcome;
+    try {
+      outcome = await deployScoredCandidate(cand.pool, deployAmount);
+    } catch (error) {
+      outcome = { ok: false, error: error.message, result: { error: error.message } };
+    }
+    await liveMessage?.toolFinish("deploy_position", outcome.result, outcome.ok);
+    if (outcome.ok) {
+      log("screening", `Deterministic deploy: ${cand.pool.name} — ${formatScoreBreakdown(cand)}`);
+      const runnerUp = ranked.find((c) => c !== cand) || null;
+      return buildDeployedReport({ winner: cand, runnerUp, result: outcome.result, deployAmount });
+    }
+    log("screening", `Deterministic deploy failed for ${cand.pool.name}: ${outcome.error}`);
+    failures.push({ pool: cand.pool.pool, error: outcome.error });
+  }
+
+  appendDecision({
+    type: "no_deploy",
+    actor: "SCREENER",
+    summary: failures.length ? "Deterministic deploy failed" : "No candidate reached the minimum score",
+    reason: failures.length
+      ? failures.map((f) => `${f.pool.slice(0, 8)}: ${f.error}`).join("; ").slice(0, 500)
+      : `Best score ${ranked[0]?.score ?? "n/a"} < min ${minScore}`,
+    rejected: ranked.slice(0, 5).map((c) => `${c.pool.name}: ${formatScoreBreakdown(c)}`),
+  });
+  return buildNoDeployReport({ ranked, minScore, failures });
 }
 
 function getLoneCandidateSkipReason({ pool, sw, n, ti } = {}) {
