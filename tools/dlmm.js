@@ -24,7 +24,7 @@ import {
   syncOpenPositions,
 } from "../state.js";
 import { recordPerformance } from "../lessons.js";
-import { isBaseMintOnCooldown, isPoolOnCooldown } from "../pool-memory.js";
+import { isBaseMintOnCooldown, isPoolOnCooldown, setPoolCooldownFor } from "../pool-memory.js";
 import { normalizeMint } from "./wallet.js";
 import { appendDecision } from "../decision-log.js";
 import { agentMeridianJson, getAgentIdForRequests, getAgentMeridianHeaders } from "./agent-meridian.js";
@@ -474,6 +474,13 @@ export async function deployPosition({
   entry_holders,
 }) {
   pool_address = normalizeMint(pool_address);
+  // Evil Panda mode: always deploy a fixed -downsidePct single-side SOL range.
+  if (config.evilPanda?.enabled) {
+    downside_pct = config.evilPanda.downsidePct;
+    upside_pct = 0;
+    bins_above = 0;
+    bins_below = undefined;
+  }
   const activeStrategy = strategy || config.strategy.strategy;
   let activeBinsBelow = bins_below ?? config.strategy.defaultBinsBelow ?? config.strategy.minBinsBelow;
   let activeBinsAbove = bins_above ?? 0;
@@ -607,7 +614,19 @@ export async function deployPosition({
     );
   }
 
-  await assertRangeDoesNotRequireBinArrayInitialization(pool, minBinId, maxBinId);
+  try {
+    await assertRangeDoesNotRequireBinArrayInitialization(pool, minBinId, maxBinId);
+  } catch (error) {
+    // Evil Panda: a -90% range often reaches uninitialized bin arrays. Skip the pool
+    // for a while so the next screening cycle picks a different one instead of retrying.
+    if (config.evilPanda?.enabled && /bin-array initialization/i.test(error.message)) {
+      setPoolCooldownFor(pool_address, config.evilPanda.binArrayCooldownHours, "EP -90% range needs uninitialized bin arrays", {
+        pool_name,
+        base_mint: baseMint,
+      });
+    }
+    throw error;
+  }
 
   const minPrice = Number(getPriceOfBinByBinId(minBinId, actualBinStep).toString());
   const maxPrice = Number(getPriceOfBinByBinId(maxBinId, actualBinStep).toString());

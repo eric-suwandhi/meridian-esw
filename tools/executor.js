@@ -22,6 +22,7 @@ import { addSmartWallet, removeSmartWallet, listSmartWallets, checkSmartWalletsO
 import { getTokenInfo, getTokenHolders, getTokenNarrative } from "./token.js";
 import { config, reloadScreeningThresholds, MIN_SAFE_BINS_BELOW } from "../config.js";
 import { getRecentDecisions } from "../decision-log.js";
+import { getEvilPandaPoolRejectReason, isEvilPandaEnabled } from "../evil-panda.js";
 import fs from "fs";
 import { execSync, spawn } from "child_process";
 import { REPO_ROOT, repoPath } from "../repo-root.js";
@@ -148,6 +149,11 @@ async function validateDeployPoolThresholds(args) {
     };
   }
 
+  const epReject = getEvilPandaPoolRejectReason(detail, { volatility });
+  if (epReject) {
+    return { pass: false, reason: `${epReject}. Refusing deploy.` };
+  }
+
   const actualBinStep = poolDetailBinStep(detail);
   const minStep = numberOrNull(config.screening.minBinStep);
   const maxStep = numberOrNull(config.screening.maxBinStep);
@@ -216,8 +222,12 @@ function normalizeConfigValue(key, value) {
     "solMode",
     "darwinEnabled",
     "lpAgentRelayEnabled",
+    "chartIndicatorsEnabled",
+    "requireAllIntervals",
+    "evilPandaEnabled",
+    "epIndicatorExitsAnyPnl",
   ]);
-  const arrayKeys = new Set(["allowedLaunchpads", "blockedLaunchpads"]);
+  const arrayKeys = new Set(["allowedLaunchpads", "blockedLaunchpads", "indicatorIntervals"]);
   const stringKeys = new Set([
     "timeframe",
     "category",
@@ -236,6 +246,11 @@ function normalizeConfigValue(key, value) {
     "pnlRpcUrl",
     "gmgnFeeSource",
     "gmgnApiKey",
+    "indicatorEntryPreset",
+    "indicatorExitPreset",
+    "epEntryPreset",
+    "epEntryInterval",
+    "epExitInterval",
   ]);
   if (value === null) return null;
   if (booleanKeys.has(key)) return coerceBoolean(value, key);
@@ -458,6 +473,18 @@ const toolMap = {
       rsiOversold: ["indicators", "rsiOversold", ["chartIndicators", "rsiOversold"]],
       rsiOverbought: ["indicators", "rsiOverbought", ["chartIndicators", "rsiOverbought"]],
       requireAllIntervals: ["indicators", "requireAllIntervals", ["chartIndicators", "requireAllIntervals"]],
+      // evil panda mode
+      evilPandaEnabled: ["evilPanda", "enabled"],
+      epDownsidePct: ["evilPanda", "downsidePct"],
+      epMinVolatility: ["evilPanda", "minVolatility"],
+      epMinBaseFeePct: ["evilPanda", "minBaseFeePct"],
+      epEntryPreset: ["evilPanda", "entryPreset"],
+      epEntryInterval: ["evilPanda", "entryInterval"],
+      epExitInterval: ["evilPanda", "exitInterval"],
+      epExitRsiLevel: ["evilPanda", "exitRsiLevel"],
+      epExitCheckSec: ["evilPanda", "exitCheckSec"],
+      epIndicatorExitsAnyPnl: ["evilPanda", "indicatorExitsAnyPnl"],
+      epBinArrayCooldownHours: ["evilPanda", "binArrayCooldownHours"],
     };
 
     const applied = {};
@@ -486,6 +513,15 @@ const toolMap = {
           normalizedVal = Math.max(MIN_SAFE_BINS_BELOW, Math.round(numericVal));
         } else {
           normalizedVal = normalizeConfigValue(match[0], val);
+        }
+        if (match[0] === "epDownsidePct" && !(normalizedVal > 0 && normalizedVal < 100)) {
+          throw new Error("epDownsidePct must be between 0 and 100 (exclusive)");
+        }
+        if ((match[0] === "epEntryInterval" || match[0] === "epExitInterval")) {
+          normalizedVal = String(normalizedVal).toUpperCase();
+          if (normalizedVal !== "5_MINUTE" && normalizedVal !== "15_MINUTE") {
+            throw new Error(`${match[0]} must be 5_MINUTE or 15_MINUTE`);
+          }
         }
         applied[match[0]] = normalizedVal;
       } catch (error) {
@@ -727,6 +763,13 @@ export async function executeTool(name, args) {
 async function runSafetyChecks(name, args) {
   switch (name) {
     case "deploy_position": {
+      // Evil Panda mode: the range is always -downsidePct single-side SOL, whatever the caller asked for.
+      if (isEvilPandaEnabled()) {
+        args.downside_pct = config.evilPanda.downsidePct;
+        args.upside_pct = 0;
+        args.bins_above = 0;
+        delete args.bins_below;
+      }
       const poolThresholds = await validateDeployPoolThresholds(args);
       if (!poolThresholds.pass) return poolThresholds;
       if (poolThresholds.entryMarketData) Object.assign(args, poolThresholds.entryMarketData);

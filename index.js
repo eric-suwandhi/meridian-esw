@@ -34,6 +34,7 @@ import { stageSignals } from "./signal-tracker.js";
 import { getWeightsSummary } from "./signal-weights.js";
 import { bootstrapHiveMind, ensureAgentId, getHiveMindPullMode, isHiveMindEnabled, pullHiveMindLessons, pullHiveMindPresets, registerHiveMindAgent, startHiveMindBackgroundSync } from "./hivemind.js";
 import { appendDecision } from "./decision-log.js";
+import { checkEvilPandaIndicatorExit, isEvilPandaEnabled } from "./evil-panda.js";
 
 import { REPO_ROOT, repoPath } from "./repo-root.js";
 
@@ -276,7 +277,8 @@ export async function runManagementCycle({ silent = false } = {}) {
         continue;
       }
 
-      const closeRule = getDeterministicCloseRule(p, config.management);
+      const closeRule = getDeterministicCloseRule(p, config.management)
+        ?? await checkEvilPandaIndicatorExit(p).catch(() => null);
       if (closeRule) {
         actionMap.set(p.position, closeRule);
         continue;
@@ -581,7 +583,9 @@ STEPS:
 1. Decide if any candidate is actually worth deploying. One surviving candidate is not automatically good enough.
 2. Pick the best candidate based on narrative quality, smart wallets, and pool metrics.
 3. Call deploy_position (active_bin is pre-fetched above — no need to call get_active_bin).
-   bins_below = round(${config.strategy.minBinsBelow} + (candidate volatility/5)*(${config.strategy.maxBinsBelow - config.strategy.minBinsBelow})) clamped to [${config.strategy.minBinsBelow},${config.strategy.maxBinsBelow}].
+${isEvilPandaEnabled()
+  ? `   EVIL PANDA MODE: range is fixed at -${config.evilPanda.downsidePct}% — pass downside_pct=${config.evilPanda.downsidePct}, bins_above=0, and omit bins_below.`
+  : `   bins_below = round(${config.strategy.minBinsBelow} + (candidate volatility/5)*(${config.strategy.maxBinsBelow - config.strategy.minBinsBelow})) clamped to [${config.strategy.minBinsBelow},${config.strategy.maxBinsBelow}].`}
    pass deploy_position.volatility = the candidate volatility value.
    For single-side SOL deploys, do not invent upside:
    set amount_y only, keep amount_x = 0, keep bins_above = 0, and let the upper bin stay at the active bin.
@@ -736,7 +740,9 @@ Summarize the current portfolio health, total fees earned, and performance of al
 
         // Detect an exit signal this tick (rule-based exits, then deterministic close rules).
         const exit = updatePnlAndCheckExits(p.position, p, config.management);
-        const closeRule = exit ? null : getDeterministicCloseRule(p, config.management);
+        const closeRule = exit
+          ? null
+          : getDeterministicCloseRule(p, config.management) ?? await checkEvilPandaIndicatorExit(p).catch(() => null);
         let signal = null, reason = null, rule = "exit";
         if (exit) { signal = exit.action; reason = exit.reason; }
         else if (closeRule) { signal = `RULE_${closeRule.rule}`; reason = closeRule.reason; rule = closeRule.rule; }
@@ -914,7 +920,9 @@ function getDeterministicCloseRule(position, managementConfig) {
   if (!pnlSuspect && position.pnl_pct != null && position.pnl_pct <= managementConfig.stopLossPct) {
     return { action: "CLOSE", rule: 1, reason: "stop loss" };
   }
-  if (!pnlSuspect && position.pnl_pct != null && position.pnl_pct >= managementConfig.takeProfitPct) {
+  // Evil Panda: trailing TP is the take-profit — skip the fixed TP rule.
+  const evilPanda = isEvilPandaEnabled();
+  if (!evilPanda && !pnlSuspect && position.pnl_pct != null && position.pnl_pct >= managementConfig.takeProfitPct) {
     return { action: "CLOSE", rule: 2, reason: "take profit" };
   }
   if (
@@ -932,7 +940,9 @@ function getDeterministicCloseRule(position, managementConfig) {
   ) {
     return { action: "CLOSE", rule: 4, reason: "OOR" };
   }
+  // Evil Panda exits are trailing / SL / 15m indicators only — no low-yield close.
   if (
+    !evilPanda &&
     position.fee_per_tvl_24h != null &&
     position.fee_per_tvl_24h < managementConfig.minFeePerTvl24h &&
     (position.age_minutes ?? 0) >= 60

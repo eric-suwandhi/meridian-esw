@@ -51,13 +51,13 @@
   "oorCooldownTriggerCount": 3,
   "oorCooldownHours": 12,
   "minVolumeToRebalance": 1000,
-  "stopLossPct": -50,
+  "stopLossPct": -30,
   "takeProfitPct": 5,
   "minFeePerTvl24h": 7,
   "minAgeBeforeYieldCheck": 60,
   "trailingTakeProfit": true,
-  "trailingTriggerPct": 3,
-  "trailingDropPct": 1.5,
+  "trailingTriggerPct": 10,
+  "trailingDropPct": 15,
   "pnlSanityMaxDiffPct": 5,
   "solMode": false,
 
@@ -93,6 +93,18 @@
 
   "gmgnFeeSource": "gmgn",
   "gmgnApiKey": "",
+
+  "evilPandaEnabled": true,
+  "epDownsidePct": 90,
+  "epMinVolatility": 1,
+  "epMinBaseFeePct": 1,
+  "epEntryPreset": "supertrend_break",
+  "epEntryInterval": "5_MINUTE",
+  "epExitInterval": "15_MINUTE",
+  "epExitRsiLevel": 90,
+  "epExitCheckSec": 60,
+  "epIndicatorExitsAnyPnl": true,
+  "epBinArrayCooldownHours": 2,
 
   "chartIndicators": {
     "enabled": false,

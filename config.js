@@ -45,6 +45,11 @@ if (u.telegramChatId) process.env.TELEGRAM_CHAT_ID ||= String(u.telegramChatId);
 
 const indicatorUserConfig = u.chartIndicators ?? {};
 
+// Evil Panda (EP) mode — fixed -90% range, vol/base-fee gates, 5m Supertrend entry,
+// 15m BB+RSI / RSI exits. When on, EP exit defaults replace the generic management
+// defaults unless the user set those keys explicitly.
+const evilPandaEnabled = u.evilPandaEnabled ?? true;
+
 // Optional standalone GMGN config file (mirrors user-config layering)
 const GMGN_CONFIG_PATH = repoPath("gmgn-config.json");
 const gmgnUserConfig = fs.existsSync(GMGN_CONFIG_PATH)
@@ -116,7 +121,7 @@ export const config = {
     repeatDeployCooldownScope: u.repeatDeployCooldownScope ?? "token", // pool | token | both
     repeatDeployCooldownMinFeeEarnedPct: u.repeatDeployCooldownMinFeeEarnedPct ?? u.repeatDeployCooldownMinFeeYieldPct ?? 0,
     minVolumeToRebalance:  u.minVolumeToRebalance  ?? 1000,
-    stopLossPct:           u.stopLossPct           ?? u.emergencyPriceDropPct ?? -50,
+    stopLossPct:           u.stopLossPct           ?? u.emergencyPriceDropPct ?? (evilPandaEnabled ? -30 : -50),
     takeProfitPct:         u.takeProfitPct         ?? u.takeProfitFeePct ?? 5,
     minFeePerTvl24h:       u.minFeePerTvl24h       ?? 7,
     minAgeBeforeYieldCheck: u.minAgeBeforeYieldCheck ?? 60, // minutes before low yield can trigger close
@@ -126,8 +131,8 @@ export const config = {
     positionSizePct:       u.positionSizePct       ?? 0.35,
     // Trailing take-profit
     trailingTakeProfit:    u.trailingTakeProfit    ?? true,
-    trailingTriggerPct:    u.trailingTriggerPct    ?? 3,    // activate trailing at X% PnL
-    trailingDropPct:       u.trailingDropPct       ?? 1.5,  // close when drops X% from peak
+    trailingTriggerPct:    u.trailingTriggerPct    ?? (evilPandaEnabled ? 10 : 3),   // activate trailing at X% PnL
+    trailingDropPct:       u.trailingDropPct       ?? (evilPandaEnabled ? 15 : 1.5), // close when drops X% from peak
     pnlSanityMaxDiffPct:   u.pnlSanityMaxDiffPct   ?? 5,    // max allowed diff between reported and derived pnl % before ignoring a tick
     // SOL mode — positions, PnL, and balances reported in SOL instead of USD
     solMode:               u.solMode               ?? false,
@@ -261,6 +266,21 @@ export const config = {
     rsiOversold: indicatorUserConfig.rsiOversold ?? 30,
     rsiOverbought: indicatorUserConfig.rsiOverbought ?? 80,
     requireAllIntervals: indicatorUserConfig.requireAllIntervals ?? false,
+  },
+
+  // ─── Evil Panda mode ───────────────────
+  evilPanda: {
+    enabled:            evilPandaEnabled,
+    downsidePct:        Number(u.epDownsidePct ?? 90),          // fixed deploy range: -X% below active price
+    minVolatility:      Number(u.epMinVolatility ?? 1),         // block pools with volatility below this
+    minBaseFeePct:      Number(u.epMinBaseFeePct ?? 1),         // block pools with base fee below this (%)
+    entryPreset:        u.epEntryPreset ?? "supertrend_break",
+    entryInterval:      u.epEntryInterval ?? "5_MINUTE",
+    exitInterval:       u.epExitInterval ?? "15_MINUTE",
+    exitRsiLevel:       Number(u.epExitRsiLevel ?? 90),         // RSI(2) level for BB+RSI and RSI exits
+    exitCheckSec:       Number(u.epExitCheckSec ?? 60),         // cache TTL for exit indicator fetches
+    indicatorExitsAnyPnl: u.epIndicatorExitsAnyPnl ?? true,     // fire indicator exits even at negative PnL
+    binArrayCooldownHours: Number(u.epBinArrayCooldownHours ?? 2), // pool cooldown when -X% range needs uninitialized bin arrays
   },
 };
 

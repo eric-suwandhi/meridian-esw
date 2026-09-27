@@ -4,6 +4,7 @@ import { isDevBlocked, getBlockedDevs } from "../dev-blocklist.js";
 import { log } from "../logger.js";
 import { isBaseMintOnCooldown, isPoolOnCooldown } from "../pool-memory.js";
 import { confirmIndicatorPreset } from "./chart-indicators.js";
+import { getEvilPandaPoolRejectReason, isEvilPandaEnabled } from "../evil-panda.js";
 import { getAgentMeridianBase, getAgentMeridianHeaders } from "./agent-meridian.js";
 
 const DATAPI_JUP = "https://datapi.jup.ag/v1";
@@ -627,6 +628,11 @@ export async function getTopCandidates({ limit = 10 } = {}) {
         pushFilteredReason(filteredOut, p, `volatility ${p.volatility ?? "unknown"} is unusable`);
         return false;
       }
+      const epReject = getEvilPandaPoolRejectReason(p);
+      if (epReject) {
+        pushFilteredReason(filteredOut, p, epReject);
+        return false;
+      }
       if (occupiedPools.has(p.pool)) {
         pushFilteredReason(filteredOut, p, "already have an open position in this pool");
         return false;
@@ -678,13 +684,19 @@ export async function getTopCandidates({ limit = 10 } = {}) {
     if (eligible.length < before) log("dev_blocklist", `Filtered ${before - eligible.length} pool(s) via dev blocklist`);
   }
 
-  if (config.indicators.enabled && eligible.length > 0) {
+  const evilPanda = isEvilPandaEnabled();
+  if ((config.indicators.enabled || evilPanda) && eligible.length > 0) {
+    // Evil Panda mode: entry is always its own preset (Supertrend break) on its own interval (5m).
+    const entryOverrides = evilPanda
+      ? { preset: config.evilPanda.entryPreset, intervals: [config.evilPanda.entryInterval], force: true }
+      : {};
     const confirmations = await Promise.all(
       eligible.map(async (pool) => {
         try {
           const confirmation = await confirmIndicatorPreset({
             mint: pool.base?.mint,
             side: "entry",
+            ...entryOverrides,
           });
           return { pool: pool.pool, confirmation };
         } catch (error) {
