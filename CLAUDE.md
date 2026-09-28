@@ -81,7 +81,7 @@ Autonomous DLMM liquidity provider agent for Meteora pools on Solana.
 |---|---:|---|
 | **Entry / orchestration** | | |
 | `index.js` | ~2016 | Daemon. Cron, REPL, Telegram bot, briefing, HiveMind bootstrap, PnL poller, deterministic close rules, single-candidate skip rule, settings menu. **All** automatic cycles start here. |
-| `agent.js` | 416 | `agentLoop(goal, maxSteps, history, agentType, model, maxOut, opts)`. The ReAct loop. Provider fallback, JSON repair, once-per-session tool locks, no-tool retries, `onToolStart`/`onToolFinish` callbacks for live Telegram messages. |
+| `agent.js` | 416 | `agentLoop(goal, maxSteps, history, agentType, model, maxOut, opts)`. The ReAct loop. The OpenAI client is created lazily (`getClient`), so the daemon starts without an LLM key; `agentLoop` then throws "No LLM configured". `isLlmConfigured()` exported. Provider fallback, JSON repair, once-per-session tool locks, no-tool retries, `onToolStart`/`onToolFinish` callbacks for live Telegram messages. |
 | `cli.js` | 676 | One-shot CLI; every tool exposed as a subcommand. Also writes a `~/.meridian/SKILL.md` at startup for agent discovery. Loads `.env`/`user-config.json` from `~/.meridian/` if present, else from cwd. |
 | `setup.js` | ~750 | Interactive first-run wizard. Three presets (degen/moderate/safe) + custom. Covers strategy, screening filters, position sizing, trailing TP, per-role models. |
 | **Config & state** | | |
@@ -168,7 +168,7 @@ Cron tasks created by `startCronJobs()`:
 |---|---|---|
 | Management | `*/managementIntervalMin * * * *` | `runManagementCycle()` |
 | Screening | `*/screeningIntervalMin * * * *` | `runScreeningCycle()` |
-| Health check | `0 * * * *` | One-shot `agentLoop` as MANAGER with health summary goal |
+| Health check | `0 * * * *` | `buildHealthReport` (`health-report.js`) — code-built, read-only summary (positions, PnL, fees, near-SL/OOR warnings, all-time stats) logged + sent to Telegram. No LLM, no tool calls. |
 | Briefing | `0 1 * * *` (UTC) | `runBriefing()` — 8 AM Jakarta |
 | Briefing watchdog | `0 */6 * * *` (UTC) | `maybeRunMissedBriefing()` — fires on startup if missed |
 | **PnL poller** | every 30s (`setInterval`) | Trailing-TP detection between management cycles (below) |

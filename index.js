@@ -35,6 +35,7 @@ import { getWeightsSummary } from "./signal-weights.js";
 import { bootstrapHiveMind, ensureAgentId, getHiveMindPullMode, isHiveMindEnabled, pullHiveMindLessons, pullHiveMindPresets, registerHiveMindAgent, startHiveMindBackgroundSync } from "./hivemind.js";
 import { appendDecision } from "./decision-log.js";
 import { checkEvilPandaIndicatorExit, getEvilPandaTokenRejectReason, isEvilPandaEnabled } from "./evil-panda.js";
+import { buildHealthReport } from "./health-report.js";
 import { buildDeployedReport, buildNoDeployReport, formatScoreBreakdown, rankCandidates, scoreDeployCandidate } from "./deterministic-screener.js";
 
 import { REPO_ROOT, repoPath } from "./repo-root.js";
@@ -697,20 +698,20 @@ export function startCronJobs() {
 
   const screenTask = cron.schedule(`*/${Math.max(1, config.schedule.screeningIntervalMin)} * * * *`, runScreeningCycle);
 
+  // Hourly health report — built in code, read-only (no LLM, cannot act on positions).
   const healthTask = cron.schedule(`0 * * * *`, async () => {
-    if (_managementBusy) return;
-    _managementBusy = true;
-    log("cron", "Starting health check");
     try {
-      await agentLoop(`
-HEALTH CHECK
-
-Summarize the current portfolio health, total fees earned, and performance of all open positions. Recommend any high-level adjustments if needed.
-      `, config.llm.maxSteps, [], "MANAGER");
+      const [wallet, positions] = await Promise.all([getWalletBalances(), getMyPositions({ force: true, silent: true })]);
+      const report = buildHealthReport({
+        wallet,
+        positions,
+        performance: getPerformanceSummary(),
+        getTracked: getTrackedPosition,
+      });
+      log("cron", `Health check:\n${report}`);
+      if (telegramEnabled()) await sendMessage(report).catch(() => {});
     } catch (error) {
       log("cron_error", `Health check failed: ${error.message}`);
-    } finally {
-      _managementBusy = false;
     }
   });
 
