@@ -390,14 +390,17 @@ export async function runScreeningCycle({ silent = false } = {}) {
     const minRequired = config.management.deployAmountSol + config.management.gasReserve;
     const isDryRun = process.env.DRY_RUN === "true";
     if (!isDryRun && !hasDeployableFunds(preBalance)) {
-      const usdcNote = usdcPoolsAllowed() ? ` and USDC ${Number(preBalance.usdc || 0).toFixed(2)} < ${config.management.minDeployUsdc}` : "";
-      log("cron", `Screening skipped — insufficient funds (SOL ${preBalance.sol.toFixed(3)} < ${minRequired} needed for deploy + gas${usdcNote})`);
-      screenReport = `Screening skipped — insufficient funds (SOL ${preBalance.sol.toFixed(3)} < ${minRequired} needed for deploy + gas${usdcNote}).`;
+      const parts = [];
+      if (solPoolsAllowed()) parts.push(`SOL ${preBalance.sol.toFixed(3)} < ${minRequired} (deploy + gas)`);
+      if (usdcPoolsAllowed()) parts.push(`USDC ${Number(preBalance.usdc || 0).toFixed(2)} < ${config.management.minDeployUsdc} or gas SOL ${preBalance.sol.toFixed(3)} < ${config.management.gasReserve}`);
+      const detail = `${pairModeLabel()}: ${parts.join(" and ") || "no pair mode enabled"}`;
+      log("cron", `Screening skipped — insufficient funds (${detail})`);
+      screenReport = `Screening skipped — insufficient funds (${detail}).`;
       appendDecision({
         type: "skip",
         actor: "SCREENER",
         summary: "Screening skipped",
-        reason: `Insufficient funds (SOL ${preBalance.sol.toFixed(3)} < ${minRequired}${usdcNote})`,
+        reason: `Insufficient funds (${detail})`,
       });
       _screeningBusy = false;
       return screenReport;
@@ -1007,13 +1010,19 @@ function describeLatestCandidates(limit = 5) {
 }
 
 function formatWalletStatus(wallet, positions) {
-  const deployAmount = computeDeployAmount(wallet.sol);
   const hive = isHiveMindEnabled() ? "on" : "off";
+  const next = [];
+  if (solPoolsAllowed()) next.push(`${computeDeployAmount(wallet.sol)} SOL`);
+  if (usdcPoolsAllowed()) {
+    const u = computeDeployAmountForQuote(config.tokens.USDC, wallet);
+    next.push(u.skipReason ? `USDC skipped (${u.skipReason})` : `${u.amount} USDC`);
+  }
   return [
-    `Wallet: ${wallet.sol} SOL ($${wallet.sol_usd})`,
+    `Wallet: ${wallet.sol} SOL ($${wallet.sol_usd})${Number(wallet.usdc) > 0 ? ` | ${wallet.usdc} USDC` : ""}`,
     `SOL price: $${wallet.sol_price}`,
+    `Pairs: ${pairModeLabel()}`,
     `Open positions: ${positions.total_positions}/${config.risk.maxPositions}`,
-    `Next deploy amount: ${deployAmount} SOL`,
+    `Next deploy amount: ${next.join(" | ") || "n/a"}`,
     `Dry run: ${process.env.DRY_RUN === "true" ? "yes" : "no"}`,
     `HiveMind: ${hive}`,
   ].join("\n");
@@ -1081,7 +1090,7 @@ function settingValue(key) {
     requireAllIntervals: config.indicators.requireAllIntervals,
     screeningMode: config.screening.screeningMode,
     detMinScore: config.screening.detMinScore,
-    usdcPools: usdcPoolsAllowed(),
+    quoteMode: config.screening.quoteMode,
   };
   return values[key];
 }
@@ -1119,7 +1128,7 @@ function renderSettingsMenu(page = "main") {
     `Strategy: ${config.strategy.strategy} | bins ${config.strategy.minBinsBelow}-${config.strategy.maxBinsBelow} | deploy ${config.management.deployAmountSol} SOL`,
     `TP/SL: ${config.management.takeProfitPct}% / ${config.management.stopLossPct}% | trailing ${config.management.trailingTakeProfit ? "on" : "off"}`,
     `Indicators: ${config.indicators.enabled ? "on" : "off"} | entry ${config.indicators.entryPreset} | ${fmtSettingValue(config.indicators.intervals)}`,
-    `Screening: ${config.screening.screeningMode}${config.screening.screeningMode === "deterministic" ? ` (min score ${config.screening.detMinScore})` : ""}`,
+    `Screening: ${config.screening.screeningMode}${config.screening.screeningMode === "deterministic" ? ` (min score ${config.screening.detMinScore})` : ""} | Pairs: ${pairModeLabel()}`,
   ].join("\n");
 
   const nav = [
@@ -1163,7 +1172,10 @@ function renderSettingsMenu(page = "main") {
         settingButton(`${config.screening.screeningMode === "llm" ? "✅ " : ""}Pick: LLM`, "cfg:set:screeningMode:llm"),
       ],
       stepButtons("detMinScore", "Min score", 5, { digits: 0 }),
-      [toggleButton("usdcPools", "USDC pools")],
+      ["sol", "usdc", "both"].map((mode) => settingButton(
+        `${config.screening.quoteMode === mode ? "✅ " : ""}Pairs: ${mode === "both" ? "Both" : mode.toUpperCase()}`,
+        `cfg:set:quoteMode:${mode}`,
+      )),
       [
         settingButton(`Strategy: spot`, "cfg:set:strategy:spot"),
         settingButton(`Strategy: bid_ask`, "cfg:set:strategy:bid_ask"),
@@ -1283,12 +1295,8 @@ async function applySettingsMenuCallback(msg) {
     return;
   }
 
-  // "usdcPools" is a menu-only alias for allowedQuoteMints.
-  const changes = key === "usdcPools"
-    ? { allowedQuoteMints: value ? [config.tokens.SOL, config.tokens.USDC] : [config.tokens.SOL] }
-    : { [key]: value };
   const result = await executeTool("update_config", {
-    changes,
+    changes: { [key]: value },
     reason: "Telegram settings menu",
   });
   if (!result?.success) {
@@ -1297,7 +1305,7 @@ async function applySettingsMenuCallback(msg) {
   }
   page = key.startsWith("indicator") || key === "chartIndicatorsEnabled" || key === "rsiLength" || key === "requireAllIntervals"
     ? "indicators"
-    : ["useDiscordSignals", "blockPvpSymbols", "screeningMode", "detMinScore", "usdcPools", "strategy", "minBinsBelow", "maxBinsBelow", "defaultBinsBelow", "managementIntervalMin", "screeningIntervalMin"].includes(key)
+    : ["useDiscordSignals", "blockPvpSymbols", "screeningMode", "detMinScore", "quoteMode", "strategy", "minBinsBelow", "maxBinsBelow", "defaultBinsBelow", "managementIntervalMin", "screeningIntervalMin"].includes(key)
       ? "screen"
       : "risk";
   await answerCallbackQuery(msg.callbackQueryId, `Updated ${key}`);
@@ -1722,11 +1730,26 @@ function usdcPoolsAllowed() {
   return Array.isArray(config.screening.allowedQuoteMints) && config.screening.allowedQuoteMints.includes(config.tokens.USDC);
 }
 
-/** Enough to open something: a SOL deploy + gas, or (USDC pools on) min USDC + gas SOL. */
+function solPoolsAllowed() {
+  return Array.isArray(config.screening.allowedQuoteMints) && config.screening.allowedQuoteMints.includes(config.tokens.SOL);
+}
+
+/**
+ * Enough to open something in the enabled pair mode:
+ *   SOL pairs  → SOL deploy amount + gas reserve;
+ *   USDC pairs → minDeployUsdc of wallet USDC + gas reserve in SOL (SOL is only gas).
+ */
 function hasDeployableFunds(balance) {
   const gas = config.management.gasReserve;
-  if (balance.sol >= config.management.deployAmountSol + gas) return true;
-  return usdcPoolsAllowed() && balance.sol >= gas && (Number(balance.usdc) || 0) >= config.management.minDeployUsdc;
+  const solOk = solPoolsAllowed() && balance.sol >= config.management.deployAmountSol + gas;
+  const usdcOk = usdcPoolsAllowed() && balance.sol >= gas && (Number(balance.usdc) || 0) >= config.management.minDeployUsdc;
+  return solOk || usdcOk;
+}
+
+function pairModeLabel() {
+  const sol = solPoolsAllowed();
+  const usdc = usdcPoolsAllowed();
+  return sol && usdc ? "SOL + USDC" : usdc ? "USDC only" : sol ? "SOL only" : "none";
 }
 
 /**

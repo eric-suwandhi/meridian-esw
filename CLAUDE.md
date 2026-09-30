@@ -450,11 +450,12 @@ Don't switch a screening / deploy / close path to `source: "free"`.
 
 ---
 
-## USDC-pair support
+## Pair mode & USDC-pair support
 
-- `allowedQuoteMints` (default SOL + USDC) is enforced in `getTopCandidates`, `validateDeployPoolThresholds`, `deployPosition` and `computeDeployAmountForQuote`. `/settings` → Screen → "USDC pools" toggles it.
-- Deposits are single-sided in the pool's **quote** token. `computeDeployAmountForQuote(quoteMint, wallet)` (`config.js`) sizes SOL pools as before; USDC pools use **wallet USDC only** (never swapped from SOL): `deployAmountUsdc`, or the SOL deploy amount × SOL price when 0, capped at wallet USDC, skipped below `minDeployUsdc` (10).
-- `index.js sizeCandidateDeploy` runs in the post-recon filter (sets `entry.deploy`) and in `deployLatestCandidate`; `hasDeployableFunds` lets screening run on USDC + gas SOL.
+- **`quoteMode`**: `"sol"` (SOL pairs only), `"usdc"` (USDC pairs only — wallet USDC opens LPs, SOL is only gas), `"both"` (default). It derives `config.screening.allowedQuoteMints` (`quoteMintsForMode`); an explicit `allowedQuoteMints` in user-config is an advanced override, and setting `quoteMode` via `update_config` updates the live list and deletes a persisted override. `/settings` → Screen → "Pairs: SOL / USDC / Both".
+- `allowedQuoteMints` is enforced in `getTopCandidates`, `validateDeployPoolThresholds`, `deployPosition` and `computeDeployAmountForQuote`. In a single-pair mode `discoverPools` adds `quote_token_address=<mint>` to the discovery query and retries once without it if the API errors or returns nothing.
+- Deposits are single-sided in the pool's **quote** token. `computeDeployAmountForQuote(quoteMint, wallet)` (`config.js`) sizes SOL pools as before; USDC pools use **wallet USDC only** (never swapped from SOL): `deployAmountUsdc` if > 0, else `positionSizePct` × wallet USDC, floor `minDeployUsdc` (10), cap `maxDeployUsdc` (0 = `maxDeployAmount` × SOL price), always ≤ wallet USDC; below the floor → skip.
+- `index.js sizeCandidateDeploy` runs in the post-recon filter (sets `entry.deploy`) and in `deployLatestCandidate`. `hasDeployableFunds` follows the pair mode (SOL: deploy + gas; USDC: `minDeployUsdc` + gas SOL). `/status` shows the pair mode and next deploy per enabled quote.
 - `deployPosition` converts `amount_y` with the quote mint's decimals (`quoteAmountToBaseUnits`; USDC 6, not the old hard-coded 1e9), skips the SOL-only LPAgent relay for USDC, and tracks `quote_mint` / `quote_symbol` / `amount_y`. `amount_sol` holds the SOL-equivalent for USDC positions (keeps the lessons unit-mix guard valid).
 - PnL (`pnl.js buildPosition`) values the quote side at its own Jupiter price; a missing quote price marks the tick suspicious.
 - After close/claim, the base token is auto-swapped into the position's quote (`getSwapTargetForPosition`) — USDC pools keep USDC.

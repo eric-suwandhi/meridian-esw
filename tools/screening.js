@@ -459,12 +459,27 @@ export async function discoverPools({
       : null,
   ].filter(Boolean).join("&&");
 
-  const data = await fetchPoolDiscoveryPage({
-    page_size,
-    filters,
-    timeframe: s.timeframe,
-    category: s.category,
-  });
+  const pageArgs = { page_size, timeframe: s.timeframe, category: s.category };
+  // Single pair mode (SOL-only / USDC-only): ask the API for that quote only, so the page
+  // isn't filled with the other quote. The field name isn't guaranteed by the API — on an
+  // error or an empty page, retry once without it (the in-code quote gate still applies).
+  const quoteFilter = Array.isArray(s.allowedQuoteMints) && s.allowedQuoteMints.length === 1
+    ? `quote_token_address=${s.allowedQuoteMints[0]}`
+    : null;
+  let data;
+  if (quoteFilter) {
+    try {
+      data = await fetchPoolDiscoveryPage({ ...pageArgs, filters: `${filters}&&${quoteFilter}` });
+      if (!Array.isArray(data?.data) || data.data.length === 0) {
+        log("screening", `Discovery quote filter returned no pools — retrying without it`);
+        data = null;
+      }
+    } catch (error) {
+      log("screening", `Discovery quote filter rejected (${error.message}) — retrying without it`);
+      data = null;
+    }
+  }
+  if (!data) data = await fetchPoolDiscoveryPage({ ...pageArgs, filters });
 
   let rawPools = Array.isArray(data.data) ? data.data : [];
 

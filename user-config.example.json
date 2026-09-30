@@ -95,12 +95,10 @@
   "gmgnApiKey": "",
 
   "readRpcUrl": "https://pump.helius-rpc.com",
-  "allowedQuoteMints": [
-    "So11111111111111111111111111111111111111112",
-    "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"
-  ],
+  "quoteMode": "both",
   "deployAmountUsdc": 0,
   "minDeployUsdc": 10,
+  "maxDeployUsdc": 0,
 
   "screeningMode": "deterministic",
   "detMinScore": 50,

@@ -20,7 +20,7 @@ import { addToBlacklist, removeFromBlacklist, listBlacklist } from "../token-bla
 import { blockDev, unblockDev, listBlockedDevs } from "../dev-blocklist.js";
 import { addSmartWallet, removeSmartWallet, listSmartWallets, checkSmartWalletsOnPool } from "../smart-wallets.js";
 import { getTokenInfo, getTokenHolders, getTokenNarrative } from "./token.js";
-import { config, reloadScreeningThresholds, MIN_SAFE_BINS_BELOW } from "../config.js";
+import { config, reloadScreeningThresholds, MIN_SAFE_BINS_BELOW, QUOTE_MODES, quoteMintsForMode } from "../config.js";
 import { getRecentDecisions } from "../decision-log.js";
 import { getEvilPandaPoolRejectReason, isEvilPandaEnabled } from "../evil-panda.js";
 import { resetRpcConnections } from "./rpc.js";
@@ -263,6 +263,7 @@ function normalizeConfigValue(key, value) {
     "epExitInterval",
     "screeningMode",
     "readRpcUrl",
+    "quoteMode",
   ]);
   if (value === null) return null;
   if (booleanKeys.has(key)) return coerceBoolean(value, key);
@@ -408,7 +409,9 @@ const toolMap = {
       detFreshAgeHours: ["screening", "detFreshAgeHours"],
       detMaxDeployAttempts: ["screening", "detMaxDeployAttempts"],
       detScoreWeights: ["screening", "detScoreWeights"],
+      quoteMode: ["screening", "quoteMode"],
       allowedQuoteMints: ["screening", "allowedQuoteMints"],
+      maxDeployUsdc: ["management", "maxDeployUsdc"],
       deployAmountUsdc: ["management", "deployAmountUsdc"],
       minDeployUsdc: ["management", "minDeployUsdc"],
       readRpcUrl: ["rpc", "readUrl"],
@@ -547,6 +550,10 @@ const toolMap = {
         } else {
           normalizedVal = normalizeConfigValue(match[0], val);
         }
+        if (match[0] === "quoteMode") {
+          normalizedVal = String(normalizedVal).toLowerCase();
+          if (!QUOTE_MODES.includes(normalizedVal)) throw new Error("quoteMode must be sol, usdc or both");
+        }
         if (match[0] === "screeningMode") {
           normalizedVal = String(normalizedVal).toLowerCase();
           if (normalizedVal !== "deterministic" && normalizedVal !== "llm") {
@@ -641,6 +648,11 @@ const toolMap = {
       } else {
         userConfig[key] = val;
       }
+    }
+    // quoteMode drives the allowed quote list; drop any stale explicit override so it can't win on restart.
+    if (applied.quoteMode != null && applied.allowedQuoteMints == null) {
+      config.screening.allowedQuoteMints = quoteMintsForMode(applied.quoteMode);
+      delete userConfig.allowedQuoteMints;
     }
     userConfig._lastAgentTune = new Date().toISOString();
     fs.writeFileSync(USER_CONFIG_PATH, JSON.stringify(userConfig, null, 2));
