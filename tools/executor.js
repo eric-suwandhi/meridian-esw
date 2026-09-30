@@ -12,7 +12,7 @@ import {
 import { getWalletBalances, swapToken } from "./wallet.js";
 import { studyTopLPers } from "./study.js";
 import { addLesson, clearAllLessons, clearPerformance, removeLessonsByKeyword, getPerformanceHistory, pinLesson, unpinLesson, listLessons } from "../lessons.js";
-import { setPositionInstruction } from "../state.js";
+import { setPositionInstruction, getTrackedPosition } from "../state.js";
 
 import { getPoolMemory, addPoolNote } from "../pool-memory.js";
 import { addStrategy, listStrategies, getStrategy, setActiveStrategy, removeStrategy } from "../strategy-library.js";
@@ -20,8 +20,10 @@ import { addToBlacklist, removeFromBlacklist, listBlacklist } from "../token-bla
 import { blockDev, unblockDev, listBlockedDevs } from "../dev-blocklist.js";
 import { addSmartWallet, removeSmartWallet, listSmartWallets, checkSmartWalletsOnPool } from "../smart-wallets.js";
 import { getTokenInfo, getTokenHolders, getTokenNarrative } from "./token.js";
-import { config, reloadScreeningThresholds, MIN_SAFE_BINS_BELOW } from "../config.js";
+import { config, reloadScreeningThresholds, MIN_SAFE_BINS_BELOW, QUOTE_MODES, quoteMintsForMode } from "../config.js";
 import { getRecentDecisions } from "../decision-log.js";
+import { getEvilPandaPoolRejectReason, isEvilPandaEnabled } from "../evil-panda.js";
+import { resetRpcConnections } from "./rpc.js";
 import fs from "fs";
 import { execSync, spawn } from "child_process";
 import { REPO_ROOT, repoPath } from "../repo-root.js";
@@ -148,6 +150,17 @@ async function validateDeployPoolThresholds(args) {
     };
   }
 
+  const quoteMint = detail?.token_y?.address ?? detail?.quote_token_address ?? null;
+  const allowedQuotes = config.screening.allowedQuoteMints;
+  if (Array.isArray(allowedQuotes) && allowedQuotes.length > 0 && !allowedQuotes.includes(quoteMint)) {
+    return { pass: false, reason: `Pool quote ${detail?.token_y?.symbol || quoteMint || "unknown"} is not supported. Refusing deploy.` };
+  }
+
+  const epReject = getEvilPandaPoolRejectReason(detail, { volatility });
+  if (epReject) {
+    return { pass: false, reason: `${epReject}. Refusing deploy.` };
+  }
+
   const actualBinStep = poolDetailBinStep(detail);
   const minStep = numberOrNull(config.screening.minBinStep);
   const maxStep = numberOrNull(config.screening.maxBinStep);
@@ -172,7 +185,7 @@ async function validateDeployPoolThresholds(args) {
     entry_holders: numberOrNull(detail?.base_token_holders ?? detail?.token_x?.holders),
   };
 
-  return { pass: true, entryMarketData };
+  return { pass: true, entryMarketData, quoteMint };
 }
 
 // Registered by index.js so update_config can restart cron jobs when intervals change
@@ -216,8 +229,15 @@ function normalizeConfigValue(key, value) {
     "solMode",
     "darwinEnabled",
     "lpAgentRelayEnabled",
+    "chartIndicatorsEnabled",
+    "requireAllIntervals",
+    "evilPandaEnabled",
+    "epIndicatorExitsAnyPnl",
+    "epRequireIcon",
+    "epSortNewestFirst",
   ]);
-  const arrayKeys = new Set(["allowedLaunchpads", "blockedLaunchpads"]);
+  const numberArrayKeys = new Set(["epAllowedBinSteps"]);
+  const arrayKeys = new Set(["allowedLaunchpads", "blockedLaunchpads", "indicatorIntervals", "allowedQuoteMints"]);
   const stringKeys = new Set([
     "timeframe",
     "category",
@@ -236,9 +256,22 @@ function normalizeConfigValue(key, value) {
     "pnlRpcUrl",
     "gmgnFeeSource",
     "gmgnApiKey",
+    "indicatorEntryPreset",
+    "indicatorExitPreset",
+    "epEntryPreset",
+    "epEntryInterval",
+    "epExitInterval",
+    "screeningMode",
+    "readRpcUrl",
+    "quoteMode",
   ]);
   if (value === null) return null;
   if (booleanKeys.has(key)) return coerceBoolean(value, key);
+  if (key === "detScoreWeights") return typeof value === "string" ? JSON.parse(value) : value; // validated by caller
+  if (numberArrayKeys.has(key)) {
+    if (!Array.isArray(value)) throw new Error(`${key} must be an array of numbers`);
+    return value.map((entry) => coerceFiniteNumber(entry, key));
+  }
   if (arrayKeys.has(key)) return coerceStringArray(value, key);
   if (stringKeys.has(key)) return coerceString(value, key);
   return coerceFiniteNumber(value, key);
@@ -371,6 +404,17 @@ const toolMap = {
       maxTokenAgeHours: ["screening", "maxTokenAgeHours"],
       minFeePerTvl24h: ["management", "minFeePerTvl24h"],
       loneCandidateMinDegen: ["screening", "loneCandidateMinDegen"],
+      screeningMode: ["screening", "screeningMode"],
+      detMinScore: ["screening", "detMinScore"],
+      detFreshAgeHours: ["screening", "detFreshAgeHours"],
+      detMaxDeployAttempts: ["screening", "detMaxDeployAttempts"],
+      detScoreWeights: ["screening", "detScoreWeights"],
+      quoteMode: ["screening", "quoteMode"],
+      allowedQuoteMints: ["screening", "allowedQuoteMints"],
+      maxDeployUsdc: ["management", "maxDeployUsdc"],
+      deployAmountUsdc: ["management", "deployAmountUsdc"],
+      minDeployUsdc: ["management", "minDeployUsdc"],
+      readRpcUrl: ["rpc", "readUrl"],
       // management
       minClaimAmount: ["management", "minClaimAmount"],
       autoSwapAfterClaim: ["management", "autoSwapAfterClaim"],
@@ -458,6 +502,25 @@ const toolMap = {
       rsiOversold: ["indicators", "rsiOversold", ["chartIndicators", "rsiOversold"]],
       rsiOverbought: ["indicators", "rsiOverbought", ["chartIndicators", "rsiOverbought"]],
       requireAllIntervals: ["indicators", "requireAllIntervals", ["chartIndicators", "requireAllIntervals"]],
+      // evil panda mode
+      evilPandaEnabled: ["evilPanda", "enabled"],
+      epDownsidePct: ["evilPanda", "downsidePct"],
+      epMinVolatility: ["evilPanda", "minVolatility"],
+      epMinBaseFeePct: ["evilPanda", "minBaseFeePct"],
+      epEntryPreset: ["evilPanda", "entryPreset"],
+      epEntryInterval: ["evilPanda", "entryInterval"],
+      epExitInterval: ["evilPanda", "exitInterval"],
+      epExitRsiLevel: ["evilPanda", "exitRsiLevel"],
+      epExitCheckSec: ["evilPanda", "exitCheckSec"],
+      epIndicatorExitsAnyPnl: ["evilPanda", "indicatorExitsAnyPnl"],
+      epBinArrayCooldownHours: ["evilPanda", "binArrayCooldownHours"],
+      epMinMcap: ["evilPanda", "minMcap"],
+      epMin24hVolumeUsd: ["evilPanda", "min24hVolumeUsd"],
+      epRequireIcon: ["evilPanda", "requireIcon"],
+      epMinTokenFeesSol: ["evilPanda", "minTokenFeesSol"],
+      epMaxTop10Pct: ["evilPanda", "maxTop10Pct"],
+      epAllowedBinSteps: ["evilPanda", "allowedBinSteps"],
+      epSortNewestFirst: ["evilPanda", "sortNewestFirst"],
     };
 
     const applied = {};
@@ -486,6 +549,33 @@ const toolMap = {
           normalizedVal = Math.max(MIN_SAFE_BINS_BELOW, Math.round(numericVal));
         } else {
           normalizedVal = normalizeConfigValue(match[0], val);
+        }
+        if (match[0] === "quoteMode") {
+          normalizedVal = String(normalizedVal).toLowerCase();
+          if (!QUOTE_MODES.includes(normalizedVal)) throw new Error("quoteMode must be sol, usdc or both");
+        }
+        if (match[0] === "screeningMode") {
+          normalizedVal = String(normalizedVal).toLowerCase();
+          if (normalizedVal !== "deterministic" && normalizedVal !== "llm") {
+            throw new Error("screeningMode must be deterministic or llm");
+          }
+        }
+        if (match[0] === "detScoreWeights") {
+          if (!normalizedVal || typeof normalizedVal !== "object" || Array.isArray(normalizedVal)) {
+            throw new Error("detScoreWeights must be an object of numbers");
+          }
+          normalizedVal = Object.fromEntries(
+            Object.entries(normalizedVal).map(([k, v]) => [k, coerceFiniteNumber(v, `detScoreWeights.${k}`)]),
+          );
+        }
+        if (match[0] === "epDownsidePct" && !(normalizedVal > 0 && normalizedVal < 100)) {
+          throw new Error("epDownsidePct must be between 0 and 100 (exclusive)");
+        }
+        if ((match[0] === "epEntryInterval" || match[0] === "epExitInterval")) {
+          normalizedVal = String(normalizedVal).toUpperCase();
+          if (normalizedVal !== "5_MINUTE" && normalizedVal !== "15_MINUTE") {
+            throw new Error(`${match[0]} must be 5_MINUTE or 15_MINUTE`);
+          }
         }
         applied[match[0]] = normalizedVal;
       } catch (error) {
@@ -559,8 +649,15 @@ const toolMap = {
         userConfig[key] = val;
       }
     }
+    // quoteMode drives the allowed quote list; drop any stale explicit override so it can't win on restart.
+    if (applied.quoteMode != null && applied.allowedQuoteMints == null) {
+      config.screening.allowedQuoteMints = quoteMintsForMode(applied.quoteMode);
+      delete userConfig.allowedQuoteMints;
+    }
     userConfig._lastAgentTune = new Date().toISOString();
     fs.writeFileSync(USER_CONFIG_PATH, JSON.stringify(userConfig, null, 2));
+
+    if (applied.readRpcUrl != null) resetRpcConnections();
 
     // Restart cron jobs if intervals changed
     const intervalChanged = applied.managementIntervalMin != null || applied.screeningIntervalMin != null || applied.pnlPollIntervalSec != null;
@@ -604,7 +701,13 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
  * fills). Treats both a throw AND result.success===false / missing tx as failure.
  * Returns { swapped, result, token } — swapped=false if nothing to do or all attempts failed.
  */
-async function swapBaseToSolWithRetry(baseMint, label) {
+/** Auto-swap target for a position: its pool's quote token (USDC pools keep USDC), else SOL. */
+export function getSwapTargetForPosition(positionAddress) {
+  const quoteMint = getTrackedPosition(positionAddress)?.quote_mint;
+  return quoteMint === config.tokens.USDC ? { mint: config.tokens.USDC, symbol: "USDC" } : { mint: config.tokens.SOL, symbol: "SOL" };
+}
+
+async function swapBaseToSolWithRetry(baseMint, label, target = { mint: config.tokens.SOL, symbol: "SOL" }) {
   const attempts = Math.max(1, Number(config.management.autoSwapRetryAttempts ?? 3));
   const delayMs = Math.max(0, Number(config.management.autoSwapRetryDelayMs ?? 3000));
   let lastErr = null;
@@ -616,8 +719,8 @@ async function swapBaseToSolWithRetry(baseMint, label) {
         // Nothing left to swap (already sold or dust) — treat as done.
         return { swapped: attempt > 1, result: null, token: null };
       }
-      log("executor", `Auto-swapping ${label} ${token.symbol || baseMint.slice(0, 8)} ($${token.usd.toFixed(2)}) back to SOL (attempt ${attempt}/${attempts})`);
-      const swapResult = await swapToken({ input_mint: baseMint, output_mint: "SOL", amount: token.balance });
+      log("executor", `Auto-swapping ${label} ${token.symbol || baseMint.slice(0, 8)} ($${token.usd.toFixed(2)}) to ${target.symbol} (attempt ${attempt}/${attempts})`);
+      const swapResult = await swapToken({ input_mint: baseMint, output_mint: target.mint, amount: token.balance });
       const ok = swapResult && swapResult.success !== false && !swapResult.error && (swapResult.tx || swapResult.amount_out);
       if (ok) return { swapped: true, result: swapResult, token };
       lastErr = swapResult?.error || swapResult?.reason || "swap returned no tx";
@@ -678,7 +781,7 @@ export async function executeTool(name, args) {
       if (name === "swap_token" && result.tx) {
         notifySwap({ inputSymbol: args.input_mint?.slice(0, 8), outputSymbol: args.output_mint === "So11111111111111111111111111111111111111112" || args.output_mint === "SOL" ? "SOL" : args.output_mint?.slice(0, 8), amountIn: result.amount_in, amountOut: result.amount_out, tx: result.tx }).catch(() => {});
       } else if (name === "deploy_position") {
-        notifyDeploy({ pair: result.pool_name || args.pool_name || args.pool_address?.slice(0, 8), amountSol: args.amount_y ?? args.amount_sol ?? 0, position: result.position, tx: result.txs?.[0] ?? result.tx, priceRange: result.price_range, rangeCoverage: result.range_coverage, binStep: result.bin_step, baseFee: result.base_fee }).catch(() => {});
+        notifyDeploy({ pair: result.pool_name || args.pool_name || args.pool_address?.slice(0, 8), amountSol: args.amount_y ?? args.amount_sol ?? 0, quoteSymbol: result.quote_symbol || "SOL", position: result.position, tx: result.txs?.[0] ?? result.tx, priceRange: result.price_range, rangeCoverage: result.range_coverage, binStep: result.bin_step, baseFee: result.base_fee }).catch(() => {});
       } else if (name === "close_position") {
         notifyClose({ pair: result.pool_name || args.position_address?.slice(0, 8), pnlUsd: result.pnl_usd ?? 0, pnlPct: result.pnl_pct ?? 0 }).catch(() => {});
         // Note low-yield closes in pool memory so screener avoids redeploying
@@ -688,16 +791,20 @@ export async function executeTool(name, args) {
         }
         // Auto-swap base token back to SOL unless user said to hold (retried).
         if (!args.skip_swap && result.base_mint) {
-          const { swapped, result: swapResult } = await swapBaseToSolWithRetry(result.base_mint, "after close");
+          const target = getSwapTargetForPosition(args.position_address);
+          const { swapped, result: swapResult } = await swapBaseToSolWithRetry(result.base_mint, "after close", target);
           if (swapped) {
             // Tell the model the swap already happened so it doesn't call swap_token again
             result.auto_swapped = true;
-            result.auto_swap_note = `Base token already auto-swapped back to SOL (${result.base_mint.slice(0, 8)} → SOL). Do NOT call swap_token again.`;
-            if (swapResult?.amount_out) result.sol_received = swapResult.amount_out;
+            result.auto_swap_note = `Base token already auto-swapped to ${target.symbol} (${result.base_mint.slice(0, 8)} → ${target.symbol}). Do NOT call swap_token again.`;
+            if (swapResult?.amount_out) {
+              if (target.symbol === "SOL") result.sol_received = swapResult.amount_out;
+              else result.usdc_received = swapResult.amount_out;
+            }
           }
         }
       } else if (name === "claim_fees" && config.management.autoSwapAfterClaim && result.base_mint) {
-        await swapBaseToSolWithRetry(result.base_mint, "after claim");
+        await swapBaseToSolWithRetry(result.base_mint, "after claim", getSwapTargetForPosition(args.position_address));
       }
     }
 
@@ -727,6 +834,13 @@ export async function executeTool(name, args) {
 async function runSafetyChecks(name, args) {
   switch (name) {
     case "deploy_position": {
+      // Evil Panda mode: the range is always -downsidePct single-side SOL, whatever the caller asked for.
+      if (isEvilPandaEnabled()) {
+        args.downside_pct = config.evilPanda.downsidePct;
+        args.upside_pct = 0;
+        args.bins_above = 0;
+        delete args.bins_below;
+      }
       const poolThresholds = await validateDeployPoolThresholds(args);
       if (!poolThresholds.pass) return poolThresholds;
       if (poolThresholds.entryMarketData) Object.assign(args, poolThresholds.entryMarketData);
@@ -833,11 +947,36 @@ async function runSafetyChecks(name, args) {
 
       // Check amount limits
       const amountY = deployAmountY;
+      const quoteIsUsdc = poolThresholds.quoteMint === config.tokens.USDC;
+      const unit = quoteIsUsdc ? "USDC" : "SOL";
       if (!Number.isFinite(amountY) || amountY <= 0) {
         return {
           pass: false,
-          reason: `Must provide a positive SOL amount (amount_y).`,
+          reason: `Must provide a positive ${unit} amount (amount_y).`,
         };
+      }
+
+      if (quoteIsUsdc) {
+        // USDC pools: wallet USDC only (never swapped from SOL); gas still paid in SOL.
+        const minUsdc = Number(config.management.minDeployUsdc) || 0;
+        if (amountY < minUsdc) {
+          return { pass: false, reason: `Amount ${amountY} USDC is below minDeployUsdc (${minUsdc} USDC).` };
+        }
+        const balance = await getWalletBalances(); // Helius — deploy path
+        const maxUsdc = config.risk.maxDeployAmount * (Number(balance.sol_price) || 0);
+        if (maxUsdc > 0 && amountY > maxUsdc) {
+          return { pass: false, reason: `USDC amount ${amountY} exceeds the per-position maximum (${config.risk.maxDeployAmount} SOL ≈ ${maxUsdc.toFixed(2)} USDC).` };
+        }
+        if (process.env.DRY_RUN !== "true") {
+          if ((Number(balance.usdc) || 0) < amountY) {
+            return { pass: false, reason: `Insufficient USDC: have ${balance.usdc} USDC, need ${amountY} USDC. USDC deploys use wallet USDC only.` };
+          }
+          const gasReserve = config.management.gasReserve;
+          if (balance.sol < gasReserve) {
+            return { pass: false, reason: `Insufficient SOL for gas: have ${balance.sol} SOL, need ${gasReserve} SOL.` };
+          }
+        }
+        return { pass: true };
       }
 
       const minDeploy = Math.max(0.1, config.management.deployAmountSol);

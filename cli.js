@@ -265,7 +265,7 @@ switch (subcommand) {
   // ── balance ──────────────────────────────────────────────────────
   case "balance": {
     const { getWalletBalances } = await import("./tools/wallet.js");
-    out(await getWalletBalances({}));
+    out(await getWalletBalances({ source: "free" }));
     break;
   }
 

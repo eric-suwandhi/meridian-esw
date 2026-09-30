@@ -11,7 +11,7 @@ import {
 } from "@solana/web3.js";
 import BN from "bn.js";
 import bs58 from "bs58";
-import { config, computeDeployAmount, MIN_SAFE_BINS_BELOW } from "../config.js";
+import { config, computeDeployAmount, MIN_SAFE_BINS_BELOW, quoteSymbolForMint } from "../config.js";
 import { log } from "../logger.js";
 import {
   trackPosition,
@@ -24,7 +24,7 @@ import {
   syncOpenPositions,
 } from "../state.js";
 import { recordPerformance } from "../lessons.js";
-import { isBaseMintOnCooldown, isPoolOnCooldown } from "../pool-memory.js";
+import { isBaseMintOnCooldown, isPoolOnCooldown, setPoolCooldownFor } from "../pool-memory.js";
 import { normalizeMint } from "./wallet.js";
 import { appendDecision } from "../decision-log.js";
 import { agentMeridianJson, getAgentIdForRequests, getAgentMeridianHeaders } from "./agent-meridian.js";
@@ -390,6 +390,22 @@ function getDlmmInstructionDiscriminators(serialized) {
 const poolCache = new Map();
 const poolMetadataCache = new Map();
 
+const _mintDecimals = new Map();
+async function getMintDecimals(mint) {
+  if (_mintDecimals.has(mint)) return _mintDecimals.get(mint);
+  const info = await getConnection().getParsedAccountInfo(new PublicKey(mint));
+  const decimals = info.value?.data?.parsed?.info?.decimals;
+  if (!Number.isInteger(decimals)) throw new Error(`Could not read decimals for mint ${mint}`);
+  _mintDecimals.set(mint, decimals);
+  return decimals;
+}
+
+/** Quote amount → base units using the quote mint's decimals (SOL 9, USDC 6). Returns a string. */
+export async function quoteAmountToBaseUnits(amount, quoteMint) {
+  const decimals = quoteMint === config.tokens.SOL ? 9 : quoteMint === config.tokens.USDC ? 6 : await getMintDecimals(quoteMint);
+  return Math.floor(Number(amount) * 10 ** decimals).toString();
+}
+
 async function getPool(poolAddress) {
   const key = poolAddress.toString();
   if (!poolCache.has(key)) {
@@ -472,8 +488,16 @@ export async function deployPosition({
   entry_tvl,
   entry_volume,
   entry_holders,
+  amount_sol_equiv, // USDC pools: SOL value of amount_y (for state/lessons sanity checks)
 }) {
   pool_address = normalizeMint(pool_address);
+  // Evil Panda mode: always deploy a fixed -downsidePct single-side SOL range.
+  if (config.evilPanda?.enabled) {
+    downside_pct = config.evilPanda.downsidePct;
+    upside_pct = 0;
+    bins_above = 0;
+    bins_below = undefined;
+  }
   const activeStrategy = strategy || config.strategy.strategy;
   let activeBinsBelow = bins_below ?? config.strategy.defaultBinsBelow ?? config.strategy.minBinsBelow;
   let activeBinsAbove = bins_above ?? 0;
@@ -492,6 +516,14 @@ export async function deployPosition({
   const { StrategyType, getBinIdFromPrice, getPriceOfBinByBinId } = await getDLMM();
   const pool = await getPool(pool_address);
   const baseMint = pool.lbPair.tokenXMint.toString();
+  // Single-sided deposit is in the pool's quote token (Y): SOL or USDC.
+  const quoteMint = pool.lbPair.tokenYMint.toString();
+  const allowedQuotes = config.screening.allowedQuoteMints;
+  if (Array.isArray(allowedQuotes) && allowedQuotes.length > 0 && !allowedQuotes.includes(quoteMint)) {
+    return { success: false, error: `Pool quote ${quoteSymbolForMint(quoteMint)} is not supported (allowed: SOL, USDC).` };
+  }
+  const quoteSymbol = quoteSymbolForMint(quoteMint);
+  const quoteIsSol = quoteMint === config.tokens.SOL;
   if (isBaseMintOnCooldown(baseMint)) {
     log("deploy", `Base mint ${baseMint.slice(0, 8)} is on cooldown — skipping deploy for pool ${pool_address.slice(0, 8)}`);
     return { success: false, error: "Token on cooldown — recently closed out-of-range too many times. Try a different token." };
@@ -533,6 +565,9 @@ export async function deployPosition({
 
   // Calculate amounts
   // If no explicit SOL amount is provided, fall back to the configured dynamic deploy size.
+  if (!quoteIsSol && amount_y == null && amount_sol == null) {
+    throw new Error(`This is a ${quoteSymbol} pool — pass amount_y in ${quoteSymbol} (wallet ${quoteSymbol} only).`);
+  }
   const fallbackAmountY =
     amount_y == null && amount_sol == null
       ? computeDeployAmount((await getWalletBalances()).sol)
@@ -588,6 +623,7 @@ export async function deployPosition({
         upside_pct: upside_pct ?? null,
         amount_x: finalAmountX,
         amount_y: finalAmountY,
+        quote_symbol: quoteSymbol,
         wide_range: totalBins > 69,
       },
       message: "DRY RUN — no transaction sent",
@@ -607,7 +643,19 @@ export async function deployPosition({
     );
   }
 
-  await assertRangeDoesNotRequireBinArrayInitialization(pool, minBinId, maxBinId);
+  try {
+    await assertRangeDoesNotRequireBinArrayInitialization(pool, minBinId, maxBinId);
+  } catch (error) {
+    // Evil Panda: a -90% range often reaches uninitialized bin arrays. Skip the pool
+    // for a while so the next screening cycle picks a different one instead of retrying.
+    if (config.evilPanda?.enabled && /bin-array initialization/i.test(error.message)) {
+      setPoolCooldownFor(pool_address, config.evilPanda.binArrayCooldownHours, "EP -90% range needs uninitialized bin arrays", {
+        pool_name,
+        base_mint: baseMint,
+      });
+    }
+    throw error;
+  }
 
   const minPrice = Number(getPriceOfBinByBinId(minBinId, actualBinStep).toString());
   const maxPrice = Number(getPriceOfBinByBinId(maxBinId, actualBinStep).toString());
@@ -619,7 +667,7 @@ export async function deployPosition({
   const baseFactor = pool.lbPair.parameters?.baseFactor ?? 0;
   const actualBaseFee = base_fee ?? (baseFactor > 0 ? parseFloat((baseFactor * actualBinStep / 1e6 * 100).toFixed(4)) : null);
 
-  const totalYLamports = new BN(Math.floor(finalAmountY * 1e9));
+  const totalYLamports = new BN(await quoteAmountToBaseUnits(finalAmountY, quoteMint));
   // Token X amount uses mint decimals when available, falling back to 9.
   let totalXLamports = new BN(0);
   if (finalAmountX > 0) {
@@ -628,7 +676,8 @@ export async function deployPosition({
     totalXLamports = new BN(Math.floor(finalAmountX * Math.pow(10, decimals)));
   }
 
-  if (shouldUseLpAgentRelayForDeploy()) {
+  // The LPAgent zap-in relay is SOL-only; USDC pools always use the direct path.
+  if (quoteIsSol && shouldUseLpAgentRelayForDeploy()) {
     try {
       const wallet = getWallet();
       log(
@@ -845,7 +894,10 @@ export async function deployPosition({
       volatility: normalizedVolatility,
       fee_tvl_ratio,
       organic_score,
-      amount_sol: finalAmountY,
+      amount_sol: quoteIsSol ? finalAmountY : (Number(amount_sol_equiv) || null),
+      amount_y: finalAmountY,
+      quote_mint: quoteMint,
+      quote_symbol: quoteSymbol,
       amount_x: finalAmountX,
       active_bin: activeBin.binId,
       initial_value_usd,
@@ -862,14 +914,16 @@ export async function deployPosition({
       pool: pool_address,
       pool_name,
       position: newPosition.publicKey.toString(),
-      summary: `Deployed ${finalAmountY} SOL with ${activeStrategy}`,
+      summary: `Deployed ${finalAmountY} ${quoteSymbol} with ${activeStrategy}`,
       reason: `Chosen range ${minBinId}→${maxBinId} around active bin ${activeBin.binId}`,
       risks: [
         normalizedVolatility != null ? `volatility ${normalizedVolatility}` : null,
         fee_tvl_ratio != null ? `fee/TVL ${fee_tvl_ratio}%` : null,
       ].filter(Boolean),
       metrics: {
-        amount_sol: finalAmountY,
+        amount_sol: quoteIsSol ? finalAmountY : (Number(amount_sol_equiv) || null),
+        amount_y: finalAmountY,
+        quote_symbol: quoteSymbol,
         strategy: activeStrategy,
         active_bin: activeBin.binId,
         min_bin: minBinId,
@@ -898,6 +952,8 @@ export async function deployPosition({
       wide_range: isWideRange,
       amount_x: finalAmountX,
       amount_y: finalAmountY,
+      quote_mint: quoteMint,
+      quote_symbol: quoteSymbol,
       txs: txHashes,
     };
   } catch (error) {

@@ -71,6 +71,11 @@ export async function getTokenInfo({ query }) {
     } : null,
     // stats_24h omitted — misleading for short-timeframe LP (reflects full pump history)
     stats_24h_net_buyers: t.stats24h ? t.stats24h.numNetBuyers : null, // keep only net buyer direction
+    // Token-wide 24h volume (all pools) + picture presence — Evil Panda coin-selection gates.
+    volume_24h: t.stats24h && (t.stats24h.buyVolume != null || t.stats24h.sellVolume != null)
+      ? Math.round(Number(t.stats24h.buyVolume ?? 0) + Number(t.stats24h.sellVolume ?? 0))
+      : null,
+    has_icon: !!t.icon,
   }));
 
   // Refine the primary match's fee figure from GMGN (the gate value consumers read).

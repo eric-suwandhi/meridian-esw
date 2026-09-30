@@ -42,10 +42,10 @@ function buildSignalSummary(payload) {
   };
 }
 
-function evaluatePreset(side, preset, payload) {
+export function evaluatePreset(side, preset, payload, thresholds = {}) {
   const summary = buildSignalSummary(payload);
-  const oversold = Number(config.indicators.rsiOversold ?? 30);
-  const overbought = Number(config.indicators.rsiOverbought ?? 80);
+  const oversold = Number(thresholds.oversold ?? config.indicators.rsiOversold ?? 30);
+  const overbought = Number(thresholds.overbought ?? config.indicators.rsiOverbought ?? 80);
   const close = summary.close;
   const previousClose = summary.previousClose;
   const lowerBand = summary.lowerBand;
@@ -202,7 +202,7 @@ function evaluatePreset(side, preset, payload) {
   }
 }
 
-async function fetchChartIndicatorsForMint(
+export async function fetchChartIndicatorsForMint(
   mint,
   {
     interval,
@@ -230,8 +230,10 @@ export async function confirmIndicatorPreset({
   preset = side === "entry" ? config.indicators.entryPreset : config.indicators.exitPreset,
   intervals = config.indicators.intervals,
   refresh = false,
+  thresholds = {},
+  force = false, // evaluate even when config.indicators.enabled is false (e.g. Evil Panda mode)
 } = {}) {
-  if (!config.indicators.enabled || !mint || !preset) {
+  if ((!config.indicators.enabled && !force) || !mint || !preset) {
     return { enabled: false, confirmed: true, reason: "Indicators disabled or not configured", intervals: [] };
   }
 
@@ -244,7 +246,7 @@ export async function confirmIndicatorPreset({
   for (const interval of targets) {
     try {
       const payload = await fetchChartIndicatorsForMint(mint, { interval, refresh });
-      const evaluation = evaluatePreset(side, preset, payload);
+      const evaluation = evaluatePreset(side, preset, payload, thresholds);
       results.push({
         interval,
         ok: true,

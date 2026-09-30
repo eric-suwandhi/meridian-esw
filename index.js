@@ -8,7 +8,7 @@ import { log } from "./logger.js";
 import { getMyPositions, closePosition, getActiveBin } from "./tools/dlmm.js";
 import { getWalletBalances } from "./tools/wallet.js";
 import { getTopCandidates, degenScore } from "./tools/screening.js";
-import { config, reloadScreeningThresholds, computeDeployAmount } from "./config.js";
+import { config, reloadScreeningThresholds, computeDeployAmount, computeDeployAmountForQuote } from "./config.js";
 import { evolveThresholds, getPerformanceSummary } from "./lessons.js";
 import { executeTool, registerCronRestarter } from "./tools/executor.js";
 import {
@@ -34,6 +34,9 @@ import { stageSignals } from "./signal-tracker.js";
 import { getWeightsSummary } from "./signal-weights.js";
 import { bootstrapHiveMind, ensureAgentId, getHiveMindPullMode, isHiveMindEnabled, pullHiveMindLessons, pullHiveMindPresets, registerHiveMindAgent, startHiveMindBackgroundSync } from "./hivemind.js";
 import { appendDecision } from "./decision-log.js";
+import { checkEvilPandaIndicatorExit, getEvilPandaTokenRejectReason, isEvilPandaEnabled } from "./evil-panda.js";
+import { buildHealthReport } from "./health-report.js";
+import { buildDeployedReport, buildNoDeployReport, formatScoreBreakdown, rankCandidates, scoreDeployCandidate } from "./deterministic-screener.js";
 
 import { REPO_ROOT, repoPath } from "./repo-root.js";
 
@@ -276,7 +279,8 @@ export async function runManagementCycle({ silent = false } = {}) {
         continue;
       }
 
-      const closeRule = getDeterministicCloseRule(p, config.management);
+      const closeRule = getDeterministicCloseRule(p, config.management)
+        ?? await checkEvilPandaIndicatorExit(p).catch(() => null);
       if (closeRule) {
         actionMap.set(p.position, closeRule);
         continue;
@@ -385,14 +389,18 @@ export async function runScreeningCycle({ silent = false } = {}) {
     }
     const minRequired = config.management.deployAmountSol + config.management.gasReserve;
     const isDryRun = process.env.DRY_RUN === "true";
-    if (!isDryRun && preBalance.sol < minRequired) {
-      log("cron", `Screening skipped — insufficient SOL (${preBalance.sol.toFixed(3)} < ${minRequired} needed for deploy + gas)`);
-      screenReport = `Screening skipped — insufficient SOL (${preBalance.sol.toFixed(3)} < ${minRequired} needed for deploy + gas).`;
+    if (!isDryRun && !hasDeployableFunds(preBalance)) {
+      const parts = [];
+      if (solPoolsAllowed()) parts.push(`SOL ${preBalance.sol.toFixed(3)} < ${minRequired} (deploy + gas)`);
+      if (usdcPoolsAllowed()) parts.push(`USDC ${Number(preBalance.usdc || 0).toFixed(2)} < ${config.management.minDeployUsdc} or gas SOL ${preBalance.sol.toFixed(3)} < ${config.management.gasReserve}`);
+      const detail = `${pairModeLabel()}: ${parts.join(" and ") || "no pair mode enabled"}`;
+      log("cron", `Screening skipped — insufficient funds (${detail})`);
+      screenReport = `Screening skipped — insufficient funds (${detail}).`;
       appendDecision({
         type: "skip",
         actor: "SCREENER",
         summary: "Screening skipped",
-        reason: `Insufficient SOL (${preBalance.sol.toFixed(3)} < ${minRequired})`,
+        reason: `Insufficient funds (${detail})`,
       });
       _screeningBusy = false;
       return screenReport;
@@ -407,7 +415,7 @@ export async function runScreeningCycle({ silent = false } = {}) {
     liveMessage = await createLiveMessage("🔍 Screening Cycle", "Scanning candidates...");
   }
   timers.screeningLastRun = Date.now();
-  log("cron", `Starting screening cycle [model: ${config.llm.screeningModel}]`);
+  log("cron", `Starting screening cycle [${config.screening.screeningMode === "deterministic" ? "deterministic scoring" : `model: ${config.llm.screeningModel}`}]`);
   try {
     // Reuse pre-fetched balance — no extra RPC call needed
     const currentBalance = preBalance;
@@ -445,7 +453,8 @@ export async function runScreeningCycle({ silent = false } = {}) {
 
     // Hard filters after token recon — block launchpads and excessive Jupiter bot holders
     const filteredOut = [];
-    const passing = allCandidates.filter(({ pool, ti }) => {
+    const passing = allCandidates.filter((entry) => {
+      const { pool, ti } = entry;
       const launchpad = ti?.launchpad ?? null;
       if (launchpad && config.screening.allowedLaunchpads?.length > 0 && !config.screening.allowedLaunchpads.includes(launchpad)) {
         log("screening", `Skipping ${pool.name} — launchpad ${launchpad} not in allow-list`);
@@ -464,6 +473,22 @@ export async function runScreeningCycle({ silent = false } = {}) {
         filteredOut.push({ name: pool.name, reason: `bot holders ${botPct}% > ${maxBotHoldersPct}%` });
         return false;
       }
+      // Evil Panda coin selection (24h volume, picture, fees, top10) — enforced for every
+      // candidate, not only the lone-candidate path.
+      const epReason = getEvilPandaTokenRejectReason(ti);
+      if (epReason) {
+        log("screening", `EP filter: dropped ${pool.name} — ${epReason}`);
+        filteredOut.push({ name: pool.name, reason: epReason });
+        return false;
+      }
+      // Size the deploy in the pool's quote token (SOL, or wallet USDC for USDC pools).
+      const sized = sizeCandidateDeploy(pool, currentBalance);
+      if (sized.skipReason) {
+        log("screening", `Funds filter: dropped ${pool.name} — ${sized.skipReason}`);
+        filteredOut.push({ name: pool.name, reason: sized.skipReason });
+        return false;
+      }
+      entry.deploy = sized;
       return true;
     });
 
@@ -482,6 +507,13 @@ export async function runScreeningCycle({ silent = false } = {}) {
         reason: combinedExamples || "All candidates filtered before deploy",
         rejected: combined.slice(0, 5).map((entry) => `${entry.name}: ${entry.reason}`),
       });
+      return screenReport;
+    }
+
+    // Deterministic mode: score in code, deploy the best qualifying candidate, no LLM.
+    // The min score replaces the lone-candidate conviction rule.
+    if (config.screening.screeningMode === "deterministic") {
+      screenReport = await runDeterministicDeploy({ passing, deployAmount, liveMessage });
       return screenReport;
     }
 
@@ -521,7 +553,7 @@ export async function runScreeningCycle({ silent = false } = {}) {
     );
 
     // Build compact candidate blocks
-    const candidateBlocks = passing.map(({ pool, sw, n, ti, mem }, i) => {
+    const candidateBlocks = passing.map(({ pool, sw, n, ti, mem, deploy }, i) => {
       const botPct = ti?.audit?.bot_holders_pct ?? "?";
       const top10Pct = ti?.audit?.top_holders_pct ?? "?";
       const feesSol = ti?.global_fees_sol ?? "?";
@@ -536,31 +568,20 @@ export async function runScreeningCycle({ silent = false } = {}) {
 
       const block = [
         `POOL: ${pool.name} (${pool.pool})`,
+        deploy ? `  deploy_amount: amount_y=${deploy.amount} ${deploy.quoteSymbol} (quote token; pass exactly this)` : null,
         `  metrics: bin_step=${pool.bin_step}, fee_pct=${pool.fee_pct}%, fee_tvl=${pool.fee_active_tvl_ratio}, vol=$${pool.volume_window}, tvl=$${pool.tvl ?? pool.active_tvl}, volatility_${pool.volatility_timeframe || "30m"}=${pool.volatility}, mcap=$${pool.mcap}, organic=${pool.organic_score}${pool.token_age_hours != null ? `, age=${pool.token_age_hours}h` : ""}`,
-        `  audit: top10=${top10Pct}%, bots=${botPct}%, fees=${feesSol}SOL${launchpad ? `, launchpad=${launchpad}` : ""}`,
+        `  audit: top10=${top10Pct}%, bots=${botPct}%, fees=${feesSol}SOL${ti?.volume_24h != null ? `, vol24h=$${ti.volume_24h}` : ""}${launchpad ? `, launchpad=${launchpad}` : ""}`,
         pvpLine,
         `  smart_wallets: ${sw?.in_pool?.length ?? 0} present${sw?.in_pool?.length ? ` → CONFIDENCE BOOST (${sw.in_pool.map(w => w.name).join(", ")})` : ""}`,
         activeBin != null ? `  active_bin: ${activeBin}` : null,
         priceChange != null ? `  1h: price${priceChange >= 0 ? "+" : ""}${priceChange}%, net_buyers=${netBuyers ?? "?"}` : null,
         n?.narrative ? `  narrative_untrusted: ${sanitizeUntrustedPromptText(n.narrative, 500)}` : `  narrative_untrusted: none`,
         mem ? `  memory_untrusted: ${sanitizeUntrustedPromptText(mem, 500)}` : null,
+        `  det_${formatScoreBreakdown(scoreDeployCandidate({ pool, sw, n, ti }))}`,
       ].filter(Boolean).join("\n");
 
       // Stage signals for Darwinian weighting — captured before LLM decides
-      if (config.darwin?.enabled) {
-        const baseMint = pool.base?.mint || pool.base_mint || ti?.mint || null;
-        stageSignals(pool.pool, {
-          base_mint:             baseMint,
-          organic_score:         pool.organic_score         ?? null,
-          fee_tvl_ratio:         pool.fee_active_tvl_ratio  ?? null,
-          volume:                pool.volume_window         ?? null,
-          mcap:                  pool.mcap                  ?? null,
-          holder_count:          ti?.holders                ?? null,
-          smart_wallets_present: (sw?.in_pool?.length ?? 0) > 0,
-          narrative_quality:     n?.narrative ? "present" : "absent",
-          volatility:            pool.volatility            ?? null,
-        });
-      }
+      if (config.darwin?.enabled) stageCandidateSignals({ pool, sw, n, ti });
 
       return block;
     });
@@ -574,17 +595,19 @@ SCREENING CYCLE
 ${strategyBlock}
 Positions: ${prePositions.total_positions}/${config.risk.maxPositions} | SOL: ${currentBalance.sol.toFixed(3)} | Deploy: ${deployAmount} SOL
 
-PRE-LOADED CANDIDATES (${passing.length} pools):
+PRE-LOADED CANDIDATES (${passing.length} pools${isEvilPandaEnabled() && config.evilPanda.sortNewestFirst ? ", listed newest token first — prefer newer tokens when quality is comparable" : ""}):
 ${candidateBlocks.join("\n\n")}
 
 STEPS:
 1. Decide if any candidate is actually worth deploying. One surviving candidate is not automatically good enough.
 2. Pick the best candidate based on narrative quality, smart wallets, and pool metrics.
 3. Call deploy_position (active_bin is pre-fetched above — no need to call get_active_bin).
-   bins_below = round(${config.strategy.minBinsBelow} + (candidate volatility/5)*(${config.strategy.maxBinsBelow - config.strategy.minBinsBelow})) clamped to [${config.strategy.minBinsBelow},${config.strategy.maxBinsBelow}].
+${isEvilPandaEnabled()
+  ? `   EVIL PANDA MODE: range is fixed at -${config.evilPanda.downsidePct}% — pass downside_pct=${config.evilPanda.downsidePct}, bins_above=0, and omit bins_below.`
+  : `   bins_below = round(${config.strategy.minBinsBelow} + (candidate volatility/5)*(${config.strategy.maxBinsBelow - config.strategy.minBinsBelow})) clamped to [${config.strategy.minBinsBelow},${config.strategy.maxBinsBelow}].`}
    pass deploy_position.volatility = the candidate volatility value.
    For single-side SOL deploys, do not invent upside:
-   set amount_y only, keep amount_x = 0, keep bins_above = 0, and let the upper bin stay at the active bin.
+   set amount_y only (use the candidate's deploy_amount — it is in that pool's quote token, SOL or USDC), keep amount_x = 0, keep bins_above = 0, and let the upper bin stay at the active bin.
 4. Report in this exact format (no tables, no extra sections):
    🚀 DEPLOYED
 
@@ -689,20 +712,20 @@ export function startCronJobs() {
 
   const screenTask = cron.schedule(`*/${Math.max(1, config.schedule.screeningIntervalMin)} * * * *`, runScreeningCycle);
 
+  // Hourly health report — built in code, read-only (no LLM, cannot act on positions).
   const healthTask = cron.schedule(`0 * * * *`, async () => {
-    if (_managementBusy) return;
-    _managementBusy = true;
-    log("cron", "Starting health check");
     try {
-      await agentLoop(`
-HEALTH CHECK
-
-Summarize the current portfolio health, total fees earned, and performance of all open positions. Recommend any high-level adjustments if needed.
-      `, config.llm.maxSteps, [], "MANAGER");
+      const [wallet, positions] = await Promise.all([getWalletBalances({ source: "free" }), getMyPositions({ force: true, silent: true })]);
+      const report = buildHealthReport({
+        wallet,
+        positions,
+        performance: getPerformanceSummary(),
+        getTracked: getTrackedPosition,
+      });
+      log("cron", `Health check:\n${report}`);
+      if (telegramEnabled()) await sendMessage(report).catch(() => {});
     } catch (error) {
       log("cron_error", `Health check failed: ${error.message}`);
-    } finally {
-      _managementBusy = false;
     }
   });
 
@@ -736,7 +759,9 @@ Summarize the current portfolio health, total fees earned, and performance of al
 
         // Detect an exit signal this tick (rule-based exits, then deterministic close rules).
         const exit = updatePnlAndCheckExits(p.position, p, config.management);
-        const closeRule = exit ? null : getDeterministicCloseRule(p, config.management);
+        const closeRule = exit
+          ? null
+          : getDeterministicCloseRule(p, config.management) ?? await checkEvilPandaIndicatorExit(p).catch(() => null);
         let signal = null, reason = null, rule = "exit";
         if (exit) { signal = exit.action; reason = exit.reason; }
         else if (closeRule) { signal = `RULE_${closeRule.rule}`; reason = closeRule.reason; rule = closeRule.rule; }
@@ -783,8 +808,7 @@ Summarize the current portfolio health, total fees earned, and performance of al
           getWalletBalances().catch(() => null),
         ]);
         if (!positions || (positions.total_positions ?? 0) >= config.risk.maxPositions) return;
-        const minRequired = config.management.deployAmountSol + config.management.gasReserve;
-        if (process.env.DRY_RUN !== "true" && (!balance || balance.sol < minRequired)) return;
+        if (process.env.DRY_RUN !== "true" && (!balance || !hasDeployableFunds(balance))) return;
 
         const top = await getTopCandidates({ limit: config.opportunity.limit }).catch(() => null);
         const candidates = (top?.candidates || []).slice().sort((a, b) => degenScore(b, config.opportunity) - degenScore(a, config.opportunity));
@@ -904,7 +928,7 @@ function getDeterministicCloseRule(position, managementConfig) {
     if (position.pnl_pct_suspicious) return true;
     if (position.pnl_pct == null) return false;
     if (position.pnl_pct > -90) return false;
-    if (tracked?.amount_sol && (position.total_value_usd ?? 0) > 0.01) {
+    if ((tracked?.amount_sol || tracked?.amount_y) && (position.total_value_usd ?? 0) > 0.01) {
       log("cron_warn", `Suspect PnL for ${position.pair}: ${position.pnl_pct}% but position still has value — skipping PnL rules`);
       return true;
     }
@@ -914,7 +938,9 @@ function getDeterministicCloseRule(position, managementConfig) {
   if (!pnlSuspect && position.pnl_pct != null && position.pnl_pct <= managementConfig.stopLossPct) {
     return { action: "CLOSE", rule: 1, reason: "stop loss" };
   }
-  if (!pnlSuspect && position.pnl_pct != null && position.pnl_pct >= managementConfig.takeProfitPct) {
+  // Evil Panda: trailing TP is the take-profit — skip the fixed TP rule.
+  const evilPanda = isEvilPandaEnabled();
+  if (!evilPanda && !pnlSuspect && position.pnl_pct != null && position.pnl_pct >= managementConfig.takeProfitPct) {
     return { action: "CLOSE", rule: 2, reason: "take profit" };
   }
   if (
@@ -932,7 +958,9 @@ function getDeterministicCloseRule(position, managementConfig) {
   ) {
     return { action: "CLOSE", rule: 4, reason: "OOR" };
   }
+  // Evil Panda exits are trailing / SL / 15m indicators only — no low-yield close.
   if (
+    !evilPanda &&
     position.fee_per_tvl_24h != null &&
     position.fee_per_tvl_24h < managementConfig.minFeePerTvl24h &&
     (position.age_minutes ?? 0) >= 60
@@ -982,13 +1010,19 @@ function describeLatestCandidates(limit = 5) {
 }
 
 function formatWalletStatus(wallet, positions) {
-  const deployAmount = computeDeployAmount(wallet.sol);
   const hive = isHiveMindEnabled() ? "on" : "off";
+  const next = [];
+  if (solPoolsAllowed()) next.push(`${computeDeployAmount(wallet.sol)} SOL`);
+  if (usdcPoolsAllowed()) {
+    const u = computeDeployAmountForQuote(config.tokens.USDC, wallet);
+    next.push(u.skipReason ? `USDC skipped (${u.skipReason})` : `${u.amount} USDC`);
+  }
   return [
-    `Wallet: ${wallet.sol} SOL ($${wallet.sol_usd})`,
+    `Wallet: ${wallet.sol} SOL ($${wallet.sol_usd})${Number(wallet.usdc) > 0 ? ` | ${wallet.usdc} USDC` : ""}`,
     `SOL price: $${wallet.sol_price}`,
+    `Pairs: ${pairModeLabel()}`,
     `Open positions: ${positions.total_positions}/${config.risk.maxPositions}`,
-    `Next deploy amount: ${deployAmount} SOL`,
+    `Next deploy amount: ${next.join(" | ") || "n/a"}`,
     `Dry run: ${process.env.DRY_RUN === "true" ? "yes" : "no"}`,
     `HiveMind: ${hive}`,
   ].join("\n");
@@ -1054,6 +1088,9 @@ function settingValue(key) {
     rsiLength: config.indicators.rsiLength,
     indicatorIntervals: config.indicators.intervals,
     requireAllIntervals: config.indicators.requireAllIntervals,
+    screeningMode: config.screening.screeningMode,
+    detMinScore: config.screening.detMinScore,
+    quoteMode: config.screening.quoteMode,
   };
   return values[key];
 }
@@ -1091,6 +1128,7 @@ function renderSettingsMenu(page = "main") {
     `Strategy: ${config.strategy.strategy} | bins ${config.strategy.minBinsBelow}-${config.strategy.maxBinsBelow} | deploy ${config.management.deployAmountSol} SOL`,
     `TP/SL: ${config.management.takeProfitPct}% / ${config.management.stopLossPct}% | trailing ${config.management.trailingTakeProfit ? "on" : "off"}`,
     `Indicators: ${config.indicators.enabled ? "on" : "off"} | entry ${config.indicators.entryPreset} | ${fmtSettingValue(config.indicators.intervals)}`,
+    `Screening: ${config.screening.screeningMode}${config.screening.screeningMode === "deterministic" ? ` (min score ${config.screening.detMinScore})` : ""} | Pairs: ${pairModeLabel()}`,
   ].join("\n");
 
   const nav = [
@@ -1129,6 +1167,15 @@ function renderSettingsMenu(page = "main") {
   } else if (page === "screen") {
     rows = [
       [toggleButton("useDiscordSignals", "Discord signals"), toggleButton("blockPvpSymbols", "PVP hard block")],
+      [
+        settingButton(`${config.screening.screeningMode === "deterministic" ? "✅ " : ""}Pick: scored`, "cfg:set:screeningMode:deterministic"),
+        settingButton(`${config.screening.screeningMode === "llm" ? "✅ " : ""}Pick: LLM`, "cfg:set:screeningMode:llm"),
+      ],
+      stepButtons("detMinScore", "Min score", 5, { digits: 0 }),
+      ["sol", "usdc", "both"].map((mode) => settingButton(
+        `${config.screening.quoteMode === mode ? "✅ " : ""}Pairs: ${mode === "both" ? "Both" : mode.toUpperCase()}`,
+        `cfg:set:quoteMode:${mode}`,
+      )),
       [
         settingButton(`Strategy: spot`, "cfg:set:strategy:spot"),
         settingButton(`Strategy: bid_ask`, "cfg:set:strategy:bid_ask"),
@@ -1235,6 +1282,7 @@ async function applySettingsMenuCallback(msg) {
     value = Number((current + delta).toFixed(4));
     if (key === "maxPositions") value = Math.max(1, Math.round(value));
     if (key === "rsiLength") value = Math.max(2, Math.round(value));
+    if (key === "detMinScore") value = Math.min(100, Math.max(0, Math.round(value)));
     if (key === "repeatDeployCooldownTriggerCount") value = Math.max(1, Math.round(value));
     if (key === "repeatDeployCooldownHours") value = Math.max(0, Math.round(value));
     if (key === "repeatDeployCooldownMinFeeEarnedPct") value = Math.max(0, value);
@@ -1257,7 +1305,7 @@ async function applySettingsMenuCallback(msg) {
   }
   page = key.startsWith("indicator") || key === "chartIndicatorsEnabled" || key === "rsiLength" || key === "requireAllIntervals"
     ? "indicators"
-    : ["useDiscordSignals", "blockPvpSymbols", "strategy", "minBinsBelow", "maxBinsBelow", "defaultBinsBelow", "managementIntervalMin", "screeningIntervalMin"].includes(key)
+    : ["useDiscordSignals", "blockPvpSymbols", "screeningMode", "detMinScore", "quoteMode", "strategy", "minBinsBelow", "maxBinsBelow", "defaultBinsBelow", "managementIntervalMin", "screeningIntervalMin"].includes(key)
       ? "screen"
       : "risk";
   await answerCallbackQuery(msg.callbackQueryId, `Updated ${key}`);
@@ -1299,7 +1347,7 @@ async function runDeterministicScreen(limit = 5) {
     const lines = candidates.map((pool, i) => {
       const feeTvl = pool.fee_active_tvl_ratio ?? pool.fee_tvl_ratio ?? "?";
       const vol = pool.volume_window ?? pool.volume_24h ?? "?";
-      return `${i + 1}. ${pool.name} | ${pool.pool}\n   fee/aTVL ${feeTvl}% | vol $${vol} | organic ${pool.organic_score ?? "?"}`;
+      return `${i + 1}. ${pool.name} | ${pool.pool}\n   fee/aTVL ${feeTvl}% | vol $${vol} | organic ${pool.organic_score ?? "?"} | degen ${degenScore(pool, config.opportunity).toFixed(0)} | age ${pool.token_age_hours ?? "?"}h`;
     });
     return `Top candidates (${candidates.length})\n\n${lines.join("\n")}`;
   }
@@ -1315,6 +1363,22 @@ async function deployLatestCandidate(index) {
   const candidate = _latestCandidates[index];
   if (!candidate) {
     throw new Error("Invalid candidate index. Run /screen first.");
+  }
+  if (isEvilPandaEnabled()) {
+    const mint = candidate.base?.mint || candidate.base_mint || null;
+    const ti = mint ? await getTokenInfo({ query: mint }).then((r) => r?.results?.[0] ?? null).catch(() => null) : null;
+    const epReason = getEvilPandaTokenRejectReason(ti);
+    if (epReason) {
+      appendDecision({
+        type: "no_deploy",
+        actor: "SCREENER",
+        summary: "Cached candidate failed Evil Panda coin selection",
+        reason: epReason,
+        pool: candidate.pool,
+        pool_name: candidate.name,
+      });
+      throw new Error(`NO DEPLOY: ${candidate.name} — ${epReason}`);
+    }
   }
   if (_latestCandidates.length === 1) {
     const mint = candidate.base?.mint || candidate.base_mint || null;
@@ -1342,27 +1406,11 @@ async function deployLatestCandidate(index) {
       throw new Error(`NO DEPLOY: only cached candidate ${candidate.name} is not worth deploying — ${skipReason}`);
     }
   }
-  const deployAmount = computeDeployAmount((await getWalletBalances()).sol);
-  const binsBelow = computeBinsBelow(candidate.volatility);
-  const result = await executeTool("deploy_position", {
-    pool_address: candidate.pool,
-    amount_y: deployAmount,
-    strategy: config.strategy.strategy,
-    bins_below: binsBelow,
-    bins_above: 0,
-    pool_name: candidate.name,
-    base_mint: candidate.base?.mint || candidate.base_mint || null,
-    bin_step: candidate.bin_step,
-    base_fee: candidate.base_fee,
-    volatility: candidate.volatility,
-    fee_tvl_ratio: candidate.fee_active_tvl_ratio ?? candidate.fee_tvl_ratio,
-    organic_score: candidate.organic_score,
-    initial_value_usd: candidate.tvl ?? candidate.active_tvl ?? null,
-  });
-  if (result?.success === false || result?.error) {
-    throw new Error(result.error || "Deploy failed");
-  }
-  return { result, candidate, deployAmount, binsBelow };
+  const sized = sizeCandidateDeploy(candidate, await getWalletBalances());
+  if (sized.skipReason) throw new Error(`NO DEPLOY: ${candidate.name} — ${sized.skipReason}`);
+  const { ok, result, error, binsBelow } = await deployScoredCandidate(candidate, sized);
+  if (!ok) throw new Error(error);
+  return { result, candidate, deployAmount: sized.amount, quoteSymbol: sized.quoteSymbol, binsBelow };
 }
 
 function appendHistory(userMsg, assistantMsg) {
@@ -1429,7 +1477,7 @@ async function telegramHandler(msg) {
 
   if (text === "/wallet" || text === "/status") {
     try {
-      const [wallet, positions] = await Promise.all([getWalletBalances(), getMyPositions({ force: true })]);
+      const [wallet, positions] = await Promise.all([getWalletBalances({ source: "free" }), getMyPositions({ force: true })]);
       const suffix = text === "/status" && positions.total_positions
         ? `\n\nUse /positions for the numbered list.`
         : "";
@@ -1577,14 +1625,14 @@ async function telegramHandler(msg) {
   if (deployMatch) {
     try {
       const idx = parseInt(deployMatch[1]) - 1;
-      const { candidate, result, deployAmount, binsBelow } = await deployLatestCandidate(idx);
+      const { candidate, result, deployAmount, quoteSymbol, binsBelow } = await deployLatestCandidate(idx);
       const coverage = result.range_coverage
         ? `Range: ${fmtPct(result.range_coverage.downside_pct)} downside | ${fmtPct(result.range_coverage.upside_pct)} upside`
         : `Strategy: ${config.strategy.strategy} | binsBelow: ${binsBelow}`;
       await sendMessage([
         `✅ Deployed ${candidate.name}`,
         `Pool: ${candidate.pool}`,
-        `Amount: ${deployAmount} SOL`,
+        `Amount: ${deployAmount} ${quoteSymbol || "SOL"}`,
         coverage,
         `Position: ${result.position || "n/a"}`,
         result.txs?.length ? `Tx: ${result.txs[0]}` : null,
@@ -1676,6 +1724,151 @@ async function telegramHandler(msg) {
 function fmtPct(value) {
   const n = Number(value);
   return Number.isFinite(n) ? `${n.toFixed(2)}%` : "?";
+}
+
+function usdcPoolsAllowed() {
+  return Array.isArray(config.screening.allowedQuoteMints) && config.screening.allowedQuoteMints.includes(config.tokens.USDC);
+}
+
+function solPoolsAllowed() {
+  return Array.isArray(config.screening.allowedQuoteMints) && config.screening.allowedQuoteMints.includes(config.tokens.SOL);
+}
+
+/**
+ * Enough to open something in the enabled pair mode:
+ *   SOL pairs  → SOL deploy amount + gas reserve;
+ *   USDC pairs → minDeployUsdc of wallet USDC + gas reserve in SOL (SOL is only gas).
+ */
+function hasDeployableFunds(balance) {
+  const gas = config.management.gasReserve;
+  const solOk = solPoolsAllowed() && balance.sol >= config.management.deployAmountSol + gas;
+  const usdcOk = usdcPoolsAllowed() && balance.sol >= gas && (Number(balance.usdc) || 0) >= config.management.minDeployUsdc;
+  return solOk || usdcOk;
+}
+
+function pairModeLabel() {
+  const sol = solPoolsAllowed();
+  const usdc = usdcPoolsAllowed();
+  return sol && usdc ? "SOL + USDC" : usdc ? "USDC only" : sol ? "SOL only" : "none";
+}
+
+/**
+ * Per-candidate deploy amount in the pool's quote token, or a skip reason.
+ * SOL pools also need the SOL amount + gas in the wallet (not checked in DRY_RUN).
+ */
+function sizeCandidateDeploy(pool, balance) {
+  const quoteMint = pool.quote?.mint ?? pool.quote_mint ?? config.tokens.SOL;
+  const sized = computeDeployAmountForQuote(quoteMint, balance);
+  if (sized.skipReason) return sized;
+  if (quoteMint === config.tokens.SOL && process.env.DRY_RUN !== "true") {
+    const need = sized.amount + config.management.gasReserve;
+    if (balance.sol < need) return { ...sized, amount: null, skipReason: `not enough SOL (have ${balance.sol}, need ${need})` };
+  }
+  const solPrice = Number(balance.sol_price) || 0;
+  return {
+    ...sized,
+    quoteMint,
+    amountSolEquiv: quoteMint === config.tokens.SOL ? sized.amount : (solPrice > 0 ? Math.round((sized.amount / solPrice) * 1e4) / 1e4 : null),
+  };
+}
+
+function stageCandidateSignals({ pool, sw, n, ti }) {
+  const baseMint = pool.base?.mint || pool.base_mint || ti?.mint || null;
+  stageSignals(pool.pool, {
+    base_mint:             baseMint,
+    organic_score:         pool.organic_score         ?? null,
+    fee_tvl_ratio:         pool.fee_active_tvl_ratio  ?? null,
+    volume:                pool.volume_window         ?? null,
+    mcap:                  pool.mcap                  ?? null,
+    holder_count:          ti?.holders                ?? null,
+    smart_wallets_present: (sw?.in_pool?.length ?? 0) > 0,
+    narrative_quality:     n?.narrative ? "present" : "absent",
+    volatility:            pool.volatility            ?? null,
+  });
+}
+
+/**
+ * Deploy one candidate through the executeTool safety pipeline.
+ * Returns { ok, result, error, binsBelow } — a safety block counts as a failure.
+ */
+async function deployScoredCandidate(candidate, sized) {
+  const deployAmount = sized.amount;
+  // EP mode forces the -X% range in runSafetyChecks/deployPosition; bins_below is ignored there.
+  const binsBelow = isEvilPandaEnabled() ? undefined : computeBinsBelow(candidate.volatility);
+  const result = await executeTool("deploy_position", {
+    pool_address: candidate.pool,
+    amount_y: deployAmount,
+    strategy: config.strategy.strategy,
+    bins_below: binsBelow,
+    bins_above: 0,
+    pool_name: candidate.name,
+    base_mint: candidate.base?.mint || candidate.base_mint || null,
+    bin_step: candidate.bin_step,
+    base_fee: candidate.base_fee ?? candidate.fee_pct,
+    volatility: candidate.volatility,
+    fee_tvl_ratio: candidate.fee_active_tvl_ratio ?? candidate.fee_tvl_ratio,
+    organic_score: candidate.organic_score,
+    initial_value_usd: candidate.tvl ?? candidate.active_tvl ?? null,
+    amount_sol_equiv: sized.amountSolEquiv ?? null,
+  });
+  const failed = !result || result.success === false || !!result.error || !!result.blocked;
+  return {
+    ok: !failed,
+    result,
+    error: failed ? (result?.error || result?.reason || "Deploy failed") : null,
+    binsBelow,
+  };
+}
+
+/**
+ * Deterministic screening decision: rank recon'd candidates, deploy the best one with
+ * score >= detMinScore (falling back to the next qualifying one on deploy failure),
+ * and return a Telegram report. No LLM involved.
+ */
+async function runDeterministicDeploy({ passing, deployAmount, liveMessage }) {
+  const minScore = Number(config.screening.detMinScore ?? 50);
+  const ranked = rankCandidates(passing);
+  log("screening", `Deterministic scores: ${ranked.map((c) => `${c.pool.name}=${c.score}`).join(", ")}`);
+
+  const qualifying = ranked.filter((c) => c.score >= minScore);
+  const maxAttempts = Math.max(1, Math.round(Number(config.screening.detMaxDeployAttempts ?? 2)));
+  const failures = [];
+
+  for (const cand of qualifying.slice(0, maxAttempts)) {
+    if (config.darwin?.enabled) stageCandidateSignals(cand);
+    await liveMessage?.toolStart("deploy_position");
+    let outcome;
+    try {
+      outcome = await deployScoredCandidate(cand.pool, cand.deploy ?? { amount: deployAmount, quoteSymbol: "SOL" });
+    } catch (error) {
+      outcome = { ok: false, error: error.message, result: { error: error.message } };
+    }
+    await liveMessage?.toolFinish("deploy_position", outcome.result, outcome.ok);
+    if (outcome.ok) {
+      log("screening", `Deterministic deploy: ${cand.pool.name} — ${formatScoreBreakdown(cand)}`);
+      const runnerUp = ranked.find((c) => c !== cand) || null;
+      return buildDeployedReport({
+        winner: cand,
+        runnerUp,
+        result: outcome.result,
+        deployAmount: cand.deploy?.amount ?? deployAmount,
+        quoteSymbol: cand.deploy?.quoteSymbol ?? "SOL",
+      });
+    }
+    log("screening", `Deterministic deploy failed for ${cand.pool.name}: ${outcome.error}`);
+    failures.push({ pool: cand.pool.pool, error: outcome.error });
+  }
+
+  appendDecision({
+    type: "no_deploy",
+    actor: "SCREENER",
+    summary: failures.length ? "Deterministic deploy failed" : "No candidate reached the minimum score",
+    reason: failures.length
+      ? failures.map((f) => `${f.pool.slice(0, 8)}: ${f.error}`).join("; ").slice(0, 500)
+      : `Best score ${ranked[0]?.score ?? "n/a"} < min ${minScore}`,
+    rejected: ranked.slice(0, 5).map((c) => `${c.pool.name}: ${formatScoreBreakdown(c)}`),
+  });
+  return buildNoDeployReport({ ranked, minScore, failures });
 }
 
 function getLoneCandidateSkipReason({ pool, sw, n, ti } = {}) {
@@ -1875,7 +2068,7 @@ Commands:
 
     if (input === "/status") {
       await runBusy(async () => {
-        const [wallet, positions] = await Promise.all([getWalletBalances(), getMyPositions({ force: true })]);
+        const [wallet, positions] = await Promise.all([getWalletBalances({ source: "free" }), getMyPositions({ force: true })]);
         console.log(`\nWallet: ${wallet.sol} SOL  ($${wallet.sol_usd})`);
         console.log(`Positions: ${positions.total_positions}`);
         for (const p of positions.positions) {

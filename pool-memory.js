@@ -223,6 +223,31 @@ export function recordPoolDeploy(poolAddress, deployData) {
   log("pool-memory", `Recorded deploy for ${entry.name} (${poolAddress.slice(0, 8)}): PnL ${deploy.pnl_pct}%`);
 }
 
+/** Put a pool on cooldown outside of the close path (e.g. a deploy the pool can't take). */
+export function setPoolCooldownFor(poolAddress, hours, reason, { pool_name = null, base_mint = null } = {}) {
+  if (!poolAddress || !(Number(hours) > 0)) return null;
+  const db = load();
+  if (!db[poolAddress]) {
+    db[poolAddress] = {
+      name: pool_name || poolAddress.slice(0, 8),
+      base_mint,
+      deploys: [],
+      total_deploys: 0,
+      avg_pnl_pct: 0,
+      win_rate: 0,
+      adjusted_win_rate: 0,
+      adjusted_win_rate_sample_count: 0,
+      last_deployed_at: null,
+      last_outcome: null,
+      notes: [],
+    };
+  }
+  const until = setPoolCooldown(db[poolAddress], Number(hours), reason);
+  save(db);
+  log("pool-memory", `Cooldown set for ${db[poolAddress].name} until ${until}: ${reason}`);
+  return until;
+}
+
 export function isPoolOnCooldown(poolAddress) {
   if (!poolAddress) return false;
   const db = load();

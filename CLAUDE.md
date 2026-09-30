@@ -81,7 +81,7 @@ Autonomous DLMM liquidity provider agent for Meteora pools on Solana.
 |---|---:|---|
 | **Entry / orchestration** | | |
 | `index.js` | ~2016 | Daemon. Cron, REPL, Telegram bot, briefing, HiveMind bootstrap, PnL poller, deterministic close rules, single-candidate skip rule, settings menu. **All** automatic cycles start here. |
-| `agent.js` | 416 | `agentLoop(goal, maxSteps, history, agentType, model, maxOut, opts)`. The ReAct loop. Provider fallback, JSON repair, once-per-session tool locks, no-tool retries, `onToolStart`/`onToolFinish` callbacks for live Telegram messages. |
+| `agent.js` | 416 | `agentLoop(goal, maxSteps, history, agentType, model, maxOut, opts)`. The ReAct loop. The OpenAI client is created lazily (`getClient`), so the daemon starts without an LLM key; `agentLoop` then throws "No LLM configured". `isLlmConfigured()` exported. Provider fallback, JSON repair, once-per-session tool locks, no-tool retries, `onToolStart`/`onToolFinish` callbacks for live Telegram messages. |
 | `cli.js` | 676 | One-shot CLI; every tool exposed as a subcommand. Also writes a `~/.meridian/SKILL.md` at startup for agent discovery. Loads `.env`/`user-config.json` from `~/.meridian/` if present, else from cwd. |
 | `setup.js` | ~750 | Interactive first-run wizard. Three presets (degen/moderate/safe) + custom. Covers strategy, screening filters, position sizing, trailing TP, per-role models. |
 | **Config & state** | | |
@@ -168,7 +168,7 @@ Cron tasks created by `startCronJobs()`:
 |---|---|---|
 | Management | `*/managementIntervalMin * * * *` | `runManagementCycle()` |
 | Screening | `*/screeningIntervalMin * * * *` | `runScreeningCycle()` |
-| Health check | `0 * * * *` | One-shot `agentLoop` as MANAGER with health summary goal |
+| Health check | `0 * * * *` | `buildHealthReport` (`health-report.js`) — code-built, read-only summary (positions, PnL, fees, near-SL/OOR warnings, all-time stats) logged + sent to Telegram. No LLM, no tool calls. |
 | Briefing | `0 1 * * *` (UTC) | `runBriefing()` — 8 AM Jakarta |
 | Briefing watchdog | `0 */6 * * *` (UTC) | `maybeRunMissedBriefing()` — fires on startup if missed |
 | **PnL poller** | every 30s (`setInterval`) | Trailing-TP detection between management cycles (below) |
@@ -320,7 +320,8 @@ All persistent files are loaded/saved on each call — no in-memory caching laye
 | `OPENROUTER_API_KEY` (or `LLM_API_KEY`) | yes | LLM provider key. |
 | `LLM_BASE_URL` | no | Override for any OpenAI-compatible endpoint (LM Studio: `http://localhost:1234/v1`). |
 | `LLM_MODEL` | no | Default model. Per-role models in `user-config.json` override. |
-| `HELIUS_API_KEY` | recommended | Wallet balance lookups via Helius. |
+| `HELIUS_API_KEY` | recommended | Helius wallet API for screening/deploy balance checks; also builds the keyed fallback RPC for reporting reads when `RPC_URL` is unset. |
+| `READ_RPC_URL` | no | Free RPC for reporting balance reads (same as `readRpcUrl`; default `https://pump.helius-rpc.com`). |
 | `LPAGENT_API_KEY` | optional | Direct LPAgent positions fetch fallback. |
 | `JUPITER_API_KEY` | optional | Better rate limit on Jupiter Swap. Default key baked in. |
 | `TELEGRAM_BOT_TOKEN` | no | Notifications + REPL. |
@@ -393,6 +394,71 @@ Standalone process — `cd discord-listener && npm install && npm start`. Shares
 | `partial_harvest` | Partial Harvest | any | Withdraw 50% at 10% return; rest keeps running. |
 
 `set_active_strategy` swaps the active one. The screener prompt mentions the active strategy in the `ACTIVE STRATEGY` block.
+
+---
+
+## Evil Panda (EP) mode (`evil-panda.js`, on by default)
+
+`evilPandaEnabled: true` (flat keys `ep*` in `user-config.json`, all in `update_config` CONFIG_MAP) overrides the generic flow:
+
+| Stage | Rule | Where enforced |
+|---|---|---|
+| Range | Always `-epDownsidePct` (90%) single-side SOL, `bins_above=0`; any `bins_below` from the LLM is ignored. | `executor.js runSafetyChecks` + `dlmm.js deployPosition` |
+| Bin arrays | If the -90% range needs uninitialized bin arrays → deploy refused (no rent paid) and pool cooldown `epBinArrayCooldownHours` (2h). | `dlmm.js` |
+| Pool gates | Block `volatility < epMinVolatility` (1), base fee `fee_pct < epMinBaseFeePct` (1%), bin step not in `epAllowedBinSteps` (80/100/125), mcap < `epMinMcap` (250k; also raises the discovery API mcap floor). | `evil-panda.js getEvilPandaPoolRejectReason` ← `screening.js getTopCandidates` + `executor.js validateDeployPoolThresholds` |
+| Token gates | After recon, for **every** candidate (not just the lone one): token 24h volume ≥ `epMin24hVolumeUsd` ($1M, Jupiter `stats24h`), has picture (`epRequireIcon`), fees ≥ `epMinTokenFeesSol` (30 SOL), top10 ≤ `epMaxTop10Pct` (30%). Missing data rejects. | `evil-panda.js getEvilPandaTokenRejectReason` ← `index.js runScreeningCycle` + `deployLatestCandidate` |
+| Order | Candidates sorted newest token first (`epSortNewestFirst`), score breaks ties. | `screening.js getTopCandidates` |
+| Entry | `epEntryPreset` (`supertrend_break`: flip or close above bullish Supertrend) on `epEntryInterval` (15m), runs even when `chartIndicators.enabled=false`. | `screening.js` |
+| Exits | Trailing TP (default trigger 10 / drop 15) and SL (default -30) via existing state/close rules. Fixed TP (rule 2) and low-yield (rule 5) are skipped. Plus 15m indicator exits at any PnL: close ≥ upper BB + RSI(2) ≥ `epExitRsiLevel` (`EP_BB_RSI`), or RSI(2) ≥ 90 (`EP_RSI`). | `index.js getDeterministicCloseRule`, management cycle, PnL poller → `checkEvilPandaIndicatorExit` |
+
+EP defaults for `stopLossPct` / `trailingTriggerPct` / `trailingDropPct` only apply when those keys are absent from `user-config.json`. Exit indicator payloads are cached per mint for `epExitCheckSec` (60s); an indicator API failure never closes a position.
+
+---
+
+## Deterministic screening (`deterministic-screener.js`)
+
+`screeningMode: "deterministic"` (default when EP is on; `"llm"` otherwise, toggle in `/settings` → Screen) replaces the LLM pick in `runScreeningCycle`. Everything up to the post-recon `passing` list is shared with the LLM path; then `runDeterministicDeploy` (`index.js`) ranks, deploys, and builds the report in code — `agentLoop` is never called.
+
+Score 0–100 = weighted sub-scores (0–1) + bonus − penalties, clamped. Weights override via `detScoreWeights`.
+
+| Part | Input | Sub-score | Default |
+|---|---|---|---:|
+| `degen` | `degenScore(pool, config.opportunity)` | /100 | 35 |
+| `fresh` | `token_age_hours` | 1 − age/`detFreshAgeHours` (72) | 20 |
+| `vol24h` | `ti.volume_24h` | log $1M→$10M | 15 |
+| `fees` | `ti.global_fees_sol` | log 30→300 SOL | 10 |
+| `holders` | `ti.audit.top_holders_pct` | (30 − top10)/30 | 10 |
+| `smartWallets` | `sw.in_pool` | any present | 10 |
+| `narrative` | `n.narrative` | bonus | +5 |
+| `pvp` / `memory` | `is_pvp` / ≥2 past deploys with avg PnL < 0 | penalty | −15 / −10 |
+
+- Deploys the best candidate with score ≥ `detMinScore` (50) via `deployScoredCandidate` → `executeTool("deploy_position")` (full safety pipeline). On failure (incl. `blocked`) tries the next qualifying candidate, up to `detMaxDeployAttempts` (2). Otherwise `no_deploy` decision with every candidate's breakdown.
+- Ties: newer token, then higher degen. The lone-candidate rule is skipped (min score replaces it).
+- LLM mode still gets a `det_score …` line per candidate block.
+
+---
+
+## RPC split (`tools/rpc.js`)
+
+| Area | RPC |
+|---|---|
+| Screening (pre-check balance, sizing, active bin, smart wallets, opportunity poller), deploy / close / claim / swap and their safety checks | `RPC_URL` + Helius wallet API (`getWalletBalances()` default `source: "helius"`) |
+| Position PnL (management cycle, PnL poller) | `pnlRpcUrl` (free `pump.helius-rpc.com`) |
+| Reporting balances: health check, `/status`, `/wallet`, terminal `/status`, CLI `balance`, LLM chat context | `getWalletBalances({ source: "free" })` → `readRpcUrl` (default `pump.helius-rpc.com`) via `withReadFallback`, falling back to keyed Helius (`RPC_URL`, else `mainnet.helius-rpc.com/?api-key=HELIUS_API_KEY`), then the Helius wallet API |
+
+Don't switch a screening / deploy / close path to `source: "free"`.
+
+---
+
+## Pair mode & USDC-pair support
+
+- **`quoteMode`**: `"sol"` (SOL pairs only), `"usdc"` (USDC pairs only — wallet USDC opens LPs, SOL is only gas), `"both"` (default). It derives `config.screening.allowedQuoteMints` (`quoteMintsForMode`); an explicit `allowedQuoteMints` in user-config is an advanced override, and setting `quoteMode` via `update_config` updates the live list and deletes a persisted override. `/settings` → Screen → "Pairs: SOL / USDC / Both".
+- `allowedQuoteMints` is enforced in `getTopCandidates`, `validateDeployPoolThresholds`, `deployPosition` and `computeDeployAmountForQuote`. In a single-pair mode `discoverPools` adds `quote_token_address=<mint>` to the discovery query and retries once without it if the API errors or returns nothing.
+- Deposits are single-sided in the pool's **quote** token. `computeDeployAmountForQuote(quoteMint, wallet)` (`config.js`) sizes SOL pools as before; USDC pools use **wallet USDC only** (never swapped from SOL): `deployAmountUsdc` if > 0, else `positionSizePct` × wallet USDC, floor `minDeployUsdc` (10), cap `maxDeployUsdc` (0 = `maxDeployAmount` × SOL price), always ≤ wallet USDC; below the floor → skip.
+- `index.js sizeCandidateDeploy` runs in the post-recon filter (sets `entry.deploy`) and in `deployLatestCandidate`. `hasDeployableFunds` follows the pair mode (SOL: deploy + gas; USDC: `minDeployUsdc` + gas SOL). `/status` shows the pair mode and next deploy per enabled quote.
+- `deployPosition` converts `amount_y` with the quote mint's decimals (`quoteAmountToBaseUnits`; USDC 6, not the old hard-coded 1e9), skips the SOL-only LPAgent relay for USDC, and tracks `quote_mint` / `quote_symbol` / `amount_y`. `amount_sol` holds the SOL-equivalent for USDC positions (keeps the lessons unit-mix guard valid).
+- PnL (`pnl.js buildPosition`) values the quote side at its own Jupiter price; a missing quote price marks the tick suspicious.
+- After close/claim, the base token is auto-swapped into the position's quote (`getSwapTargetForPosition`) — USDC pools keep USDC.
 
 ---
 

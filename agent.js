@@ -93,11 +93,24 @@ import { getDecisionSummary } from "./decision-log.js";
 
 // Supports OpenRouter (default) or any OpenAI-compatible local server (e.g. LM Studio)
 // To use LM Studio: set LLM_BASE_URL=http://localhost:1234/v1 and LLM_API_KEY=lm-studio in .env
-const client = new OpenAI({
-  baseURL: process.env.LLM_BASE_URL || "https://openrouter.ai/api/v1",
-  apiKey: process.env.LLM_API_KEY || process.env.OPENROUTER_API_KEY,
-  timeout: 5 * 60 * 1000,
-});
+// Created lazily on first use so the daemon starts (and runs deterministic screening,
+// management and health checks) without any LLM key configured.
+let _client = null;
+export function isLlmConfigured() {
+  return !!(process.env.LLM_API_KEY || process.env.OPENROUTER_API_KEY);
+}
+function getClient() {
+  if (_client) return _client;
+  if (!isLlmConfigured()) {
+    throw new Error("No LLM configured — set LLM_API_KEY or OPENROUTER_API_KEY in .env to use LLM features (chat, screeningMode \"llm\", position notes).");
+  }
+  _client = new OpenAI({
+    baseURL: process.env.LLM_BASE_URL || "https://openrouter.ai/api/v1",
+    apiKey: process.env.LLM_API_KEY || process.env.OPENROUTER_API_KEY,
+    timeout: 5 * 60 * 1000,
+  });
+  return _client;
+}
 
 const DEFAULT_MODEL = process.env.LLM_MODEL || "openrouter/healer-alpha";
 
@@ -156,8 +169,9 @@ function isThinkingModeToolChoiceError(error) {
  */
 export async function agentLoop(goal, maxSteps = config.llm.maxSteps, sessionHistory = [], agentType = "GENERAL", model = null, maxOutputTokens = null, options = {}) {
   const { interactive = false, onToolStart = null, onToolFinish = null } = options;
+  const client = getClient(); // fails fast with a clear message when no LLM key is set
   // Build dynamic system prompt with current portfolio state
-  const [portfolio, positions] = await Promise.all([getWalletBalances(), getMyPositions()]);
+  const [portfolio, positions] = await Promise.all([getWalletBalances({ source: "free" }), getMyPositions()]);
   const stateSummary = getStateSummary();
   const lessons = getLessonsForPrompt({ agentType });
   const perfSummary = getPerformanceSummary();

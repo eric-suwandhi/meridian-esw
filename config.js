@@ -45,6 +45,27 @@ if (u.telegramChatId) process.env.TELEGRAM_CHAT_ID ||= String(u.telegramChatId);
 
 const indicatorUserConfig = u.chartIndicators ?? {};
 
+// Evil Panda (EP) mode — fixed -90% range, vol/base-fee gates, 5m Supertrend entry,
+// 15m BB+RSI / RSI exits. When on, EP exit defaults replace the generic management
+// defaults unless the user set those keys explicitly.
+const evilPandaEnabled = u.evilPandaEnabled ?? true;
+
+export const SOL_MINT = "So11111111111111111111111111111111111111112";
+export const USDC_MINT = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v";
+
+// Pair mode: which quote token the bot LPs with. "sol" = SOL pairs only, "usdc" = USDC pairs
+// only (wallet USDC opens LPs, SOL is just gas), "both" = either.
+export const QUOTE_MODES = ["sol", "usdc", "both"];
+export function normalizeQuoteMode(mode) {
+  const m = String(mode ?? "").trim().toLowerCase();
+  return QUOTE_MODES.includes(m) ? m : "both";
+}
+export function quoteMintsForMode(mode) {
+  const m = normalizeQuoteMode(mode);
+  return m === "sol" ? [SOL_MINT] : m === "usdc" ? [USDC_MINT] : [SOL_MINT, USDC_MINT];
+}
+const quoteMode = normalizeQuoteMode(u.quoteMode);
+
 // Optional standalone GMGN config file (mirrors user-config layering)
 const GMGN_CONFIG_PATH = repoPath("gmgn-config.json");
 const gmgnUserConfig = fs.existsSync(GMGN_CONFIG_PATH)
@@ -94,6 +115,16 @@ export const config = {
     maxBotHoldersPct:  u.maxBotHoldersPct  ?? 30,  // max bot holder addresses % (Jupiter audit)
     maxTop10Pct:       u.maxTop10Pct       ?? 60,  // max top 10 holders concentration
     loneCandidateMinDegen: u.loneCandidateMinDegen ?? 50, // degen score that lets a SOLO candidate deploy without a narrative
+    // Screening decision: "deterministic" scores + deploys in code (deterministic-screener.js); "llm" lets the LLM pick.
+    screeningMode:        u.screeningMode ?? (evilPandaEnabled ? "deterministic" : "llm"),
+    detMinScore:          Number(u.detMinScore ?? 50),         // min 0..100 score to deploy
+    detFreshAgeHours:     Number(u.detFreshAgeHours ?? 72),    // token age where the freshness sub-score hits 0
+    detMaxDeployAttempts: Number(u.detMaxDeployAttempts ?? 2), // qualifying candidates to try if a deploy fails
+    detScoreWeights:      u.detScoreWeights && typeof u.detScoreWeights === "object" ? u.detScoreWeights : {},
+    // Quote tokens the bot may LP against (single-sided in the quote). Derived from quoteMode;
+    // an explicit allowedQuoteMints in user-config is an advanced override.
+    quoteMode,
+    allowedQuoteMints:    Array.isArray(u.allowedQuoteMints) ? u.allowedQuoteMints : quoteMintsForMode(quoteMode),
     allowedLaunchpads: u.allowedLaunchpads ?? [],  // allow-list launchpads, [] = no allow-list
     blockedLaunchpads:  u.blockedLaunchpads  ?? [],  // e.g. ["letsbonk.fun", "pump.fun"]
     minTokenAgeHours:   u.minTokenAgeHours   ?? null, // null = no minimum
@@ -116,18 +147,23 @@ export const config = {
     repeatDeployCooldownScope: u.repeatDeployCooldownScope ?? "token", // pool | token | both
     repeatDeployCooldownMinFeeEarnedPct: u.repeatDeployCooldownMinFeeEarnedPct ?? u.repeatDeployCooldownMinFeeYieldPct ?? 0,
     minVolumeToRebalance:  u.minVolumeToRebalance  ?? 1000,
-    stopLossPct:           u.stopLossPct           ?? u.emergencyPriceDropPct ?? -50,
+    stopLossPct:           u.stopLossPct           ?? u.emergencyPriceDropPct ?? (evilPandaEnabled ? -30 : -50),
     takeProfitPct:         u.takeProfitPct         ?? u.takeProfitFeePct ?? 5,
     minFeePerTvl24h:       u.minFeePerTvl24h       ?? 7,
     minAgeBeforeYieldCheck: u.minAgeBeforeYieldCheck ?? 60, // minutes before low yield can trigger close
     minSolToOpen:          u.minSolToOpen          ?? 0.55,
     deployAmountSol:       u.deployAmountSol       ?? 0.5,
+    // USDC-pair deploys use wallet USDC only: positionSizePct of wallet USDC (compounding),
+    // floor minDeployUsdc, cap maxDeployUsdc. deployAmountUsdc > 0 = fixed amount instead.
+    deployAmountUsdc:      Number(u.deployAmountUsdc ?? 0),
+    minDeployUsdc:         Number(u.minDeployUsdc ?? 10),  // floor; skip USDC pools below this
+    maxDeployUsdc:         Number(u.maxDeployUsdc ?? 0),   // 0 = maxDeployAmount × SOL price
     gasReserve:            u.gasReserve            ?? 0.2,
     positionSizePct:       u.positionSizePct       ?? 0.35,
     // Trailing take-profit
     trailingTakeProfit:    u.trailingTakeProfit    ?? true,
-    trailingTriggerPct:    u.trailingTriggerPct    ?? 3,    // activate trailing at X% PnL
-    trailingDropPct:       u.trailingDropPct       ?? 1.5,  // close when drops X% from peak
+    trailingTriggerPct:    u.trailingTriggerPct    ?? (evilPandaEnabled ? 10 : 3),   // activate trailing at X% PnL
+    trailingDropPct:       u.trailingDropPct       ?? (evilPandaEnabled ? 15 : 1.5), // close when drops X% from peak
     pnlSanityMaxDiffPct:   u.pnlSanityMaxDiffPct   ?? 5,    // max allowed diff between reported and derived pnl % before ignoring a tick
     // SOL mode — positions, PnL, and balances reported in SOL instead of USD
     solMode:               u.solMode               ?? false,
@@ -172,8 +208,8 @@ export const config = {
 
   // ─── Common Token Mints ────────────────
   tokens: {
-    SOL:  "So11111111111111111111111111111111111111112",
-    USDC: "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v",
+    SOL:  SOL_MINT,
+    USDC: USDC_MINT,
     USDT: "Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB",
   },
 
@@ -189,6 +225,12 @@ export const config = {
     url: nonEmptyString(u.agentMeridianApiUrl, process.env.AGENT_MERIDIAN_API_URL, DEFAULT_AGENT_MERIDIAN_API_URL),
     publicApiKey: nonEmptyString(u.publicApiKey, process.env.PUBLIC_API_KEY, DEFAULT_AGENT_MERIDIAN_PUBLIC_KEY),
     lpAgentRelayEnabled: u.lpAgentRelayEnabled ?? false,
+  },
+
+  // ─── Read-only RPC for management/reporting (health, /status, /wallet) ──
+  // Screening/deploy/close stay on RPC_URL (Helius). Fallback = keyed Helius.
+  rpc: {
+    readUrl: nonEmptyString(u.readRpcUrl, process.env.READ_RPC_URL, "https://pump.helius-rpc.com"),
   },
 
   // ─── PnL fetcher / poller (public infra: RPC + Meteora deposits + Jupiter) ──
@@ -262,6 +304,29 @@ export const config = {
     rsiOverbought: indicatorUserConfig.rsiOverbought ?? 80,
     requireAllIntervals: indicatorUserConfig.requireAllIntervals ?? false,
   },
+
+  // ─── Evil Panda mode ───────────────────
+  evilPanda: {
+    enabled:            evilPandaEnabled,
+    downsidePct:        Number(u.epDownsidePct ?? 90),          // fixed deploy range: -X% below active price
+    minVolatility:      Number(u.epMinVolatility ?? 1),         // block pools with volatility below this
+    minBaseFeePct:      Number(u.epMinBaseFeePct ?? 1),         // block pools with base fee below this (%)
+    entryPreset:        u.epEntryPreset ?? "supertrend_break",
+    entryInterval:      u.epEntryInterval ?? "15_MINUTE",
+    exitInterval:       u.epExitInterval ?? "15_MINUTE",
+    exitRsiLevel:       Number(u.epExitRsiLevel ?? 90),         // RSI(2) level for BB+RSI and RSI exits
+    exitCheckSec:       Number(u.epExitCheckSec ?? 60),         // cache TTL for exit indicator fetches
+    indicatorExitsAnyPnl: u.epIndicatorExitsAnyPnl ?? true,     // fire indicator exits even at negative PnL
+    binArrayCooldownHours: Number(u.epBinArrayCooldownHours ?? 2), // pool cooldown when -X% range needs uninitialized bin arrays
+    // Coin selection
+    minMcap:            Number(u.epMinMcap ?? 250_000),
+    min24hVolumeUsd:    Number(u.epMin24hVolumeUsd ?? 1_000_000), // token 24h volume across all pools (Jupiter)
+    requireIcon:        u.epRequireIcon ?? true,                  // skip tokens without a picture
+    minTokenFeesSol:    Number(u.epMinTokenFeesSol ?? 30),
+    maxTop10Pct:        Number(u.epMaxTop10Pct ?? 30),
+    allowedBinSteps:    Array.isArray(u.epAllowedBinSteps) ? u.epAllowedBinSteps.map(Number) : [80, 100, 125],
+    sortNewestFirst:    u.epSortNewestFirst ?? true,
+  },
 };
 
 /**
@@ -285,6 +350,53 @@ export function computeDeployAmount(walletSol) {
   const dynamic    = deployable * pct;
   const result     = Math.min(ceil, Math.max(floor, dynamic));
   return parseFloat(result.toFixed(2));
+}
+
+export function quoteSymbolForMint(mint) {
+  if (mint === SOL_MINT) return "SOL";
+  if (mint === USDC_MINT) return "USDC";
+  return mint ? `${String(mint).slice(0, 4)}…` : "?";
+}
+
+/**
+ * Deploy amount in the pool's quote token (single-sided deposit).
+ *   SOL pools  → computeDeployAmount(wallet.sol), as before.
+ *   USDC pools → wallet USDC only: deployAmountUsdc if set, else positionSizePct × wallet USDC,
+ *                floored at minDeployUsdc and capped at maxDeployUsdc (0 = maxDeployAmount × SOL
+ *                price); always capped at the wallet's USDC; below minDeployUsdc → skip.
+ * @returns {{ amount: number|null, quoteSymbol: string, skipReason: string|null }}
+ */
+export function computeDeployAmountForQuote(quoteMint, wallet = {}) {
+  const quoteSymbol = quoteSymbolForMint(quoteMint);
+  const allowed = config.screening.allowedQuoteMints;
+  if (quoteMint && Array.isArray(allowed) && allowed.length > 0 && !allowed.includes(quoteMint)) {
+    return { amount: null, quoteSymbol, skipReason: `${quoteSymbol} pools are disabled (allowedQuoteMints)` };
+  }
+  if (!quoteMint || quoteMint === SOL_MINT) {
+    return { amount: computeDeployAmount(Number(wallet.sol) || 0), quoteSymbol: "SOL", skipReason: null };
+  }
+  if (quoteMint !== USDC_MINT) {
+    return { amount: null, quoteSymbol, skipReason: `quote ${quoteSymbol} not supported` };
+  }
+  const m = config.management;
+  const usdc = Number(wallet.usdc) || 0;
+  const min = Number(m.minDeployUsdc) || 0;
+  const fixed = Number(m.deployAmountUsdc) || 0;
+  let target;
+  if (fixed > 0) {
+    target = fixed;
+  } else {
+    const solPrice = Number(wallet.sol_price) || 0;
+    const cap = Number(m.maxDeployUsdc) > 0
+      ? Number(m.maxDeployUsdc)
+      : (solPrice > 0 ? config.risk.maxDeployAmount * solPrice : Infinity);
+    target = Math.min(cap, Math.max(min, usdc * (Number(m.positionSizePct) || 0.35)));
+  }
+  const amount = Math.floor(Math.min(target, usdc) * 100) / 100;
+  if (amount < min) {
+    return { amount: null, quoteSymbol, skipReason: `not enough USDC (have ${usdc.toFixed(2)}, need ≥ ${min})` };
+  }
+  return { amount, quoteSymbol, skipReason: null };
 }
 
 /**

@@ -4,6 +4,7 @@ import { isDevBlocked, getBlockedDevs } from "../dev-blocklist.js";
 import { log } from "../logger.js";
 import { isBaseMintOnCooldown, isPoolOnCooldown } from "../pool-memory.js";
 import { confirmIndicatorPreset } from "./chart-indicators.js";
+import { compareNewestFirst, getEvilPandaPoolRejectReason, isEvilPandaEnabled } from "../evil-panda.js";
 import { getAgentMeridianBase, getAgentMeridianHeaders } from "./agent-meridian.js";
 
 const DATAPI_JUP = "https://datapi.jup.ag/v1";
@@ -440,7 +441,7 @@ export async function discoverPools({
     s.excludeHighSupplyConcentration ? "base_token_has_high_supply_concentration=false" : null,
     "base_token_has_high_single_ownership=false",
     "pool_type=dlmm",
-    `base_token_market_cap>=${s.minMcap}`,
+    `base_token_market_cap>=${isEvilPandaEnabled() ? Math.max(Number(s.minMcap) || 0, config.evilPanda.minMcap) : s.minMcap}`,
     `base_token_market_cap<=${s.maxMcap}`,
     `base_token_holders>=${s.minHolders}`,
     `volume>=${s.minVolume}`,
@@ -458,12 +459,27 @@ export async function discoverPools({
       : null,
   ].filter(Boolean).join("&&");
 
-  const data = await fetchPoolDiscoveryPage({
-    page_size,
-    filters,
-    timeframe: s.timeframe,
-    category: s.category,
-  });
+  const pageArgs = { page_size, timeframe: s.timeframe, category: s.category };
+  // Single pair mode (SOL-only / USDC-only): ask the API for that quote only, so the page
+  // isn't filled with the other quote. The field name isn't guaranteed by the API — on an
+  // error or an empty page, retry once without it (the in-code quote gate still applies).
+  const quoteFilter = Array.isArray(s.allowedQuoteMints) && s.allowedQuoteMints.length === 1
+    ? `quote_token_address=${s.allowedQuoteMints[0]}`
+    : null;
+  let data;
+  if (quoteFilter) {
+    try {
+      data = await fetchPoolDiscoveryPage({ ...pageArgs, filters: `${filters}&&${quoteFilter}` });
+      if (!Array.isArray(data?.data) || data.data.length === 0) {
+        log("screening", `Discovery quote filter returned no pools — retrying without it`);
+        data = null;
+      }
+    } catch (error) {
+      log("screening", `Discovery quote filter rejected (${error.message}) — retrying without it`);
+      data = null;
+    }
+  }
+  if (!data) data = await fetchPoolDiscoveryPage({ ...pageArgs, filters });
 
   let rawPools = Array.isArray(data.data) ? data.data : [];
 
@@ -627,6 +643,17 @@ export async function getTopCandidates({ limit = 10 } = {}) {
         pushFilteredReason(filteredOut, p, `volatility ${p.volatility ?? "unknown"} is unusable`);
         return false;
       }
+      const quoteMint = p.quote?.mint ?? p.token_y?.address ?? null;
+      const allowedQuotes = config.screening.allowedQuoteMints;
+      if (Array.isArray(allowedQuotes) && allowedQuotes.length > 0 && !allowedQuotes.includes(quoteMint)) {
+        pushFilteredReason(filteredOut, p, `quote ${p.quote?.symbol || quoteMint || "unknown"} not supported`);
+        return false;
+      }
+      const epReject = getEvilPandaPoolRejectReason(p);
+      if (epReject) {
+        pushFilteredReason(filteredOut, p, epReject);
+        return false;
+      }
       if (occupiedPools.has(p.pool)) {
         pushFilteredReason(filteredOut, p, "already have an open position in this pool");
         return false;
@@ -647,7 +674,10 @@ export async function getTopCandidates({ limit = 10 } = {}) {
       }
       return true;
     })
-    .sort((a, b) => scoreCandidate(b) - scoreCandidate(a))
+    // Evil Panda: newest token first (score breaks ties); otherwise score order.
+    .sort((a, b) =>
+      (isEvilPandaEnabled() && config.evilPanda.sortNewestFirst ? compareNewestFirst(a, b) : 0) ||
+      scoreCandidate(b) - scoreCandidate(a))
     .slice(0, limit);
 
   if (config.screening.avoidPvpSymbols && eligible.length > 0) {
@@ -678,13 +708,19 @@ export async function getTopCandidates({ limit = 10 } = {}) {
     if (eligible.length < before) log("dev_blocklist", `Filtered ${before - eligible.length} pool(s) via dev blocklist`);
   }
 
-  if (config.indicators.enabled && eligible.length > 0) {
+  const evilPanda = isEvilPandaEnabled();
+  if ((config.indicators.enabled || evilPanda) && eligible.length > 0) {
+    // Evil Panda mode: entry is always its own preset (Supertrend break) on its own interval (5m).
+    const entryOverrides = evilPanda
+      ? { preset: config.evilPanda.entryPreset, intervals: [config.evilPanda.entryInterval], force: true }
+      : {};
     const confirmations = await Promise.all(
       eligible.map(async (pool) => {
         try {
           const confirmation = await confirmIndicatorPreset({
             mint: pool.base?.mint,
             side: "entry",
+            ...entryOverrides,
           });
           return { pool: pool.pool, confirmation };
         } catch (error) {
