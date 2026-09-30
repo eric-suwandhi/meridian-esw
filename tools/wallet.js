@@ -8,6 +8,8 @@ import {
 import bs58 from "bs58";
 import { log } from "../logger.js";
 import { config } from "../config.js";
+import { withReadFallback } from "./rpc.js";
+import { getJupiterPrices } from "./pnl.js";
 
 let _connection = null;
 let _wallet = null;
@@ -53,17 +55,81 @@ function getJupiterReferralParams() {
 }
 
 /**
- * Get current wallet balances: SOL, USDC, and all SPL tokens using Helius Wallet API.
- * Returns USD-denominated values provided by Helius.
+ * Get current wallet balances: SOL, USDC, and all SPL tokens.
+ *
+ *   source "helius" (default) — Helius Wallet API. Used by screening, deploy and close paths.
+ *   source "free"             — plain RPC reads on the free endpoint (config.rpc.readUrl) with
+ *                               keyed-Helius fallback, USD values from Jupiter. Used only by
+ *                               management/reporting: health check, /status, /wallet, CLI.
+ * Both return the same shape.
  */
-export async function getWalletBalances() {
+export async function getWalletBalances({ source = "helius" } = {}) {
   let walletAddress;
   try {
     walletAddress = getWallet().publicKey.toString();
   } catch {
     return { wallet: null, sol: 0, sol_price: 0, sol_usd: 0, usdc: 0, tokens: [], total_usd: 0, error: "Wallet not configured" };
   }
+  if (source === "free") {
+    try {
+      return await getWalletBalancesFromRpc(walletAddress);
+    } catch (error) {
+      log("wallet_warn", `Free-RPC balance read failed (${error.message}) — using Helius wallet API`);
+    }
+  }
+  return getWalletBalancesFromHelius(walletAddress);
+}
 
+const TOKEN_PROGRAM_ID = new PublicKey("TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA");
+const TOKEN_2022_PROGRAM_ID = new PublicKey("TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb");
+
+async function getWalletBalancesFromRpc(walletAddress) {
+  const owner = new PublicKey(walletAddress);
+  const [lamports, legacy, t22] = await withReadFallback("wallet balances", (conn) => Promise.all([
+    conn.getBalance(owner, "confirmed"),
+    conn.getParsedTokenAccountsByOwner(owner, { programId: TOKEN_PROGRAM_ID }, "confirmed"),
+    conn.getParsedTokenAccountsByOwner(owner, { programId: TOKEN_2022_PROGRAM_ID }, "confirmed"),
+  ]));
+
+  // Merge token accounts per mint (a wallet can hold several accounts of one mint).
+  const byMint = new Map();
+  for (const acc of [...(legacy?.value || []), ...(t22?.value || [])]) {
+    const info = acc?.account?.data?.parsed?.info;
+    const amount = Number(info?.tokenAmount?.uiAmount ?? 0);
+    if (!info?.mint || !(amount > 0)) continue;
+    byMint.set(info.mint, (byMint.get(info.mint) ?? 0) + amount);
+  }
+
+  const sol = lamports / LAMPORTS_PER_SOL;
+  const prices = await getJupiterPrices([config.tokens.SOL, ...byMint.keys()]);
+  const solPrice = Number(prices[config.tokens.SOL]) || 0;
+  const usdc = byMint.get(config.tokens.USDC) ?? 0;
+
+  const tokens = [{ mint: config.tokens.SOL, symbol: "SOL", balance: sol, usd: solPrice ? Math.round(sol * solPrice * 100) / 100 : null }];
+  for (const [mint, balance] of byMint) {
+    const price = Number(prices[mint]);
+    tokens.push({
+      mint,
+      symbol: mint === config.tokens.USDC ? "USDC" : mint.slice(0, 8),
+      balance,
+      usd: Number.isFinite(price) && price > 0 ? Math.round(balance * price * 100) / 100 : null,
+    });
+  }
+  const totalUsd = tokens.reduce((sum, t) => sum + (t.usd ?? 0), 0);
+
+  return {
+    wallet: walletAddress,
+    sol: Math.round(sol * 1e6) / 1e6,
+    sol_price: Math.round(solPrice * 100) / 100,
+    sol_usd: Math.round(sol * solPrice * 100) / 100,
+    usdc: Math.round(usdc * 100) / 100,
+    tokens,
+    total_usd: Math.round(totalUsd * 100) / 100,
+    source: "free-rpc",
+  };
+}
+
+async function getWalletBalancesFromHelius(walletAddress) {
   const HELIUS_KEY = process.env.HELIUS_API_KEY;
   if (!HELIUS_KEY) {
     log("wallet_error", "HELIUS_API_KEY not set in .env");

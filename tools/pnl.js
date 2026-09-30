@@ -83,7 +83,7 @@ export async function fetchDlmmPnlForPool(poolAddress, walletAddress) {
 }
 
 // ─── Jupiter prices (never cached) ──────────────────────────────
-async function getJupiterPrices(mints) {
+export async function getJupiterPrices(mints) {
   const list = unique(mints.map((m) => String(m).trim()));
   if (!list.length) return {};
   try {
@@ -150,18 +150,21 @@ function mapEntries(map) {
 }
 
 // ─── Build the shaped position object (matches getMyPositions output) ──
-function buildPosition(f, prices, solUsd, meteora, solMode) {
+export function buildPosition(f, prices, solUsd, meteora, solMode) {
   const priceX = f.baseMint ? (prices[f.baseMint] ?? 0) : 0;
+  // Quote (Y) is SOL or USDC — value it at its own price, not always SOL's.
+  const quoteIsSol = !f.quoteMint || f.quoteMint === config.tokens.SOL;
+  const quoteUsd = quoteIsSol ? solUsd : (prices[f.quoteMint] ?? null);
 
   const xHuman = safeNum(f.xRaw) / 10 ** f.decX;
   const yHuman = safeNum(f.yRaw) / 10 ** f.decY;
-  const balancesUsd = xHuman * priceX + yHuman * (solUsd ?? 0);
-  const balancesSol = solUsd ? balancesUsd / solUsd : yHuman;
+  const balancesUsd = xHuman * priceX + yHuman * (quoteUsd ?? 0);
+  const balancesSol = solUsd ? balancesUsd / solUsd : (quoteIsSol ? yHuman : 0);
 
   const feeXHuman = safeNum(f.feeXRaw) / 10 ** f.decX;
   const feeYHuman = safeNum(f.feeYRaw) / 10 ** f.decY;
-  const claimableUsd = feeXHuman * priceX + feeYHuman * (solUsd ?? 0);
-  const claimableSol = solUsd ? claimableUsd / solUsd : feeYHuman;
+  const claimableUsd = feeXHuman * priceX + feeYHuman * (quoteUsd ?? 0);
+  const claimableSol = solUsd ? claimableUsd / solUsd : (quoteIsSol ? feeYHuman : 0);
 
   const depositsUsd = safeNum(meteora?.allTimeDeposits?.total?.usd);
   const depositsSol = safeNum(meteora?.allTimeDeposits?.total?.sol);
@@ -190,11 +193,14 @@ function buildPosition(f, prices, solUsd, meteora, solMode) {
   //  - Jupiter outage → solUsd/priceX missing → balances collapse → false STOP_LOSS
   //  - missing Meteora deposits → 0 cost basis → garbage pnl / inflated value
   const holdsTokenX = xHuman > 0 || feeXHuman > 0;
-  const priceMissing = !(solUsd > 0) || (holdsTokenX && !!f.baseMint && !(priceX > 0));
+  const holdsQuote = yHuman > 0 || feeYHuman > 0;
+  const priceMissing = !(solUsd > 0)
+    || (holdsTokenX && !!f.baseMint && !(priceX > 0))
+    || (holdsQuote && !(quoteUsd > 0));
   const depositsMissing = (solMode ? depositsSol : depositsUsd) <= 0;
   const pnlPctSuspicious = priceMissing || depositsMissing;
   if (pnlPctSuspicious) {
-    log("pnl_warn", `${f.position.slice(0, 8)} suspicious tick — priceMissing=${priceMissing} depositsMissing=${depositsMissing} (solUsd=${solUsd}, priceX=${priceX})`);
+    log("pnl_warn", `${f.position.slice(0, 8)} suspicious tick — priceMissing=${priceMissing} depositsMissing=${depositsMissing} (solUsd=${solUsd}, priceX=${priceX}, quoteUsd=${quoteUsd})`);
   }
 
   const inRange = f.active != null && f.lower != null && f.upper != null
@@ -213,8 +219,9 @@ function buildPosition(f, prices, solUsd, meteora, solMode) {
   return {
     position:           f.position,
     pool:               f.pool,
-    pair:               tracked?.pool_name || (meteora ? `${meteora.tokenX ?? "?"}/${meteora.tokenY ?? "SOL"}` : "?/SOL"),
+    pair:               tracked?.pool_name || (meteora ? `${meteora.tokenX ?? "?"}/${meteora.tokenY ?? (quoteIsSol ? "SOL" : "USDC")}` : `?/${quoteIsSol ? "SOL" : "USDC"}`),
     base_mint:          f.baseMint,
+    quote_mint:         f.quoteMint ?? config.tokens.SOL,
     lower_bin:          f.lower ?? tracked?.bin_range?.min ?? null,
     upper_bin:          f.upper ?? tracked?.bin_range?.max ?? null,
     active_bin:         f.active ?? tracked?.bin_range?.active ?? null,
@@ -259,6 +266,7 @@ export async function computePositions(walletAddress) {
     const decX = info?.tokenX?.mint?.decimals ?? 9;
     const decY = info?.tokenY?.mint?.decimals ?? 9;
     const baseMint = info?.tokenX?.mint?.address?.toString?.() ?? null;
+    const quoteMint = info?.tokenY?.mint?.address?.toString?.() ?? null;
     const active = info?.lbPair?.activeId ?? null;
     for (const p of info?.lbPairPositionsData || []) {
       const d = p.positionData || {};
@@ -266,6 +274,7 @@ export async function computePositions(walletAddress) {
         position: p.publicKey.toString(),
         pool: lbPairKey,
         baseMint,
+        quoteMint,
         decX,
         decY,
         active,
@@ -284,7 +293,7 @@ export async function computePositions(walletAddress) {
   }
 
   const [prices, meteoraByPosition] = await Promise.all([
-    getJupiterPrices([SOL_MINT, ...flat.map((f) => f.baseMint)]),
+    getJupiterPrices([SOL_MINT, ...flat.map((f) => f.baseMint), ...flat.map((f) => f.quoteMint).filter(Boolean)]),
     getMeteoraData(conn, walletAddress, flat),
   ]);
   const solUsd = prices[SOL_MINT] ?? null;

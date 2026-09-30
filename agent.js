@@ -171,7 +171,7 @@ export async function agentLoop(goal, maxSteps = config.llm.maxSteps, sessionHis
   const { interactive = false, onToolStart = null, onToolFinish = null } = options;
   const client = getClient(); // fails fast with a clear message when no LLM key is set
   // Build dynamic system prompt with current portfolio state
-  const [portfolio, positions] = await Promise.all([getWalletBalances(), getMyPositions()]);
+  const [portfolio, positions] = await Promise.all([getWalletBalances({ source: "free" }), getMyPositions()]);
   const stateSummary = getStateSummary();
   const lessons = getLessonsForPrompt({ agentType });
   const perfSummary = getPerformanceSummary();

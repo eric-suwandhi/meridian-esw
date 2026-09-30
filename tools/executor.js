@@ -12,7 +12,7 @@ import {
 import { getWalletBalances, swapToken } from "./wallet.js";
 import { studyTopLPers } from "./study.js";
 import { addLesson, clearAllLessons, clearPerformance, removeLessonsByKeyword, getPerformanceHistory, pinLesson, unpinLesson, listLessons } from "../lessons.js";
-import { setPositionInstruction } from "../state.js";
+import { setPositionInstruction, getTrackedPosition } from "../state.js";
 
 import { getPoolMemory, addPoolNote } from "../pool-memory.js";
 import { addStrategy, listStrategies, getStrategy, setActiveStrategy, removeStrategy } from "../strategy-library.js";
@@ -23,6 +23,7 @@ import { getTokenInfo, getTokenHolders, getTokenNarrative } from "./token.js";
 import { config, reloadScreeningThresholds, MIN_SAFE_BINS_BELOW } from "../config.js";
 import { getRecentDecisions } from "../decision-log.js";
 import { getEvilPandaPoolRejectReason, isEvilPandaEnabled } from "../evil-panda.js";
+import { resetRpcConnections } from "./rpc.js";
 import fs from "fs";
 import { execSync, spawn } from "child_process";
 import { REPO_ROOT, repoPath } from "../repo-root.js";
@@ -149,6 +150,12 @@ async function validateDeployPoolThresholds(args) {
     };
   }
 
+  const quoteMint = detail?.token_y?.address ?? detail?.quote_token_address ?? null;
+  const allowedQuotes = config.screening.allowedQuoteMints;
+  if (Array.isArray(allowedQuotes) && allowedQuotes.length > 0 && !allowedQuotes.includes(quoteMint)) {
+    return { pass: false, reason: `Pool quote ${detail?.token_y?.symbol || quoteMint || "unknown"} is not supported. Refusing deploy.` };
+  }
+
   const epReject = getEvilPandaPoolRejectReason(detail, { volatility });
   if (epReject) {
     return { pass: false, reason: `${epReject}. Refusing deploy.` };
@@ -178,7 +185,7 @@ async function validateDeployPoolThresholds(args) {
     entry_holders: numberOrNull(detail?.base_token_holders ?? detail?.token_x?.holders),
   };
 
-  return { pass: true, entryMarketData };
+  return { pass: true, entryMarketData, quoteMint };
 }
 
 // Registered by index.js so update_config can restart cron jobs when intervals change
@@ -230,7 +237,7 @@ function normalizeConfigValue(key, value) {
     "epSortNewestFirst",
   ]);
   const numberArrayKeys = new Set(["epAllowedBinSteps"]);
-  const arrayKeys = new Set(["allowedLaunchpads", "blockedLaunchpads", "indicatorIntervals"]);
+  const arrayKeys = new Set(["allowedLaunchpads", "blockedLaunchpads", "indicatorIntervals", "allowedQuoteMints"]);
   const stringKeys = new Set([
     "timeframe",
     "category",
@@ -255,6 +262,7 @@ function normalizeConfigValue(key, value) {
     "epEntryInterval",
     "epExitInterval",
     "screeningMode",
+    "readRpcUrl",
   ]);
   if (value === null) return null;
   if (booleanKeys.has(key)) return coerceBoolean(value, key);
@@ -400,6 +408,10 @@ const toolMap = {
       detFreshAgeHours: ["screening", "detFreshAgeHours"],
       detMaxDeployAttempts: ["screening", "detMaxDeployAttempts"],
       detScoreWeights: ["screening", "detScoreWeights"],
+      allowedQuoteMints: ["screening", "allowedQuoteMints"],
+      deployAmountUsdc: ["management", "deployAmountUsdc"],
+      minDeployUsdc: ["management", "minDeployUsdc"],
+      readRpcUrl: ["rpc", "readUrl"],
       // management
       minClaimAmount: ["management", "minClaimAmount"],
       autoSwapAfterClaim: ["management", "autoSwapAfterClaim"],
@@ -633,6 +645,8 @@ const toolMap = {
     userConfig._lastAgentTune = new Date().toISOString();
     fs.writeFileSync(USER_CONFIG_PATH, JSON.stringify(userConfig, null, 2));
 
+    if (applied.readRpcUrl != null) resetRpcConnections();
+
     // Restart cron jobs if intervals changed
     const intervalChanged = applied.managementIntervalMin != null || applied.screeningIntervalMin != null || applied.pnlPollIntervalSec != null;
     if (intervalChanged && _cronRestarter) {
@@ -675,7 +689,13 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
  * fills). Treats both a throw AND result.success===false / missing tx as failure.
  * Returns { swapped, result, token } — swapped=false if nothing to do or all attempts failed.
  */
-async function swapBaseToSolWithRetry(baseMint, label) {
+/** Auto-swap target for a position: its pool's quote token (USDC pools keep USDC), else SOL. */
+export function getSwapTargetForPosition(positionAddress) {
+  const quoteMint = getTrackedPosition(positionAddress)?.quote_mint;
+  return quoteMint === config.tokens.USDC ? { mint: config.tokens.USDC, symbol: "USDC" } : { mint: config.tokens.SOL, symbol: "SOL" };
+}
+
+async function swapBaseToSolWithRetry(baseMint, label, target = { mint: config.tokens.SOL, symbol: "SOL" }) {
   const attempts = Math.max(1, Number(config.management.autoSwapRetryAttempts ?? 3));
   const delayMs = Math.max(0, Number(config.management.autoSwapRetryDelayMs ?? 3000));
   let lastErr = null;
@@ -687,8 +707,8 @@ async function swapBaseToSolWithRetry(baseMint, label) {
         // Nothing left to swap (already sold or dust) — treat as done.
         return { swapped: attempt > 1, result: null, token: null };
       }
-      log("executor", `Auto-swapping ${label} ${token.symbol || baseMint.slice(0, 8)} ($${token.usd.toFixed(2)}) back to SOL (attempt ${attempt}/${attempts})`);
-      const swapResult = await swapToken({ input_mint: baseMint, output_mint: "SOL", amount: token.balance });
+      log("executor", `Auto-swapping ${label} ${token.symbol || baseMint.slice(0, 8)} ($${token.usd.toFixed(2)}) to ${target.symbol} (attempt ${attempt}/${attempts})`);
+      const swapResult = await swapToken({ input_mint: baseMint, output_mint: target.mint, amount: token.balance });
       const ok = swapResult && swapResult.success !== false && !swapResult.error && (swapResult.tx || swapResult.amount_out);
       if (ok) return { swapped: true, result: swapResult, token };
       lastErr = swapResult?.error || swapResult?.reason || "swap returned no tx";
@@ -749,7 +769,7 @@ export async function executeTool(name, args) {
       if (name === "swap_token" && result.tx) {
         notifySwap({ inputSymbol: args.input_mint?.slice(0, 8), outputSymbol: args.output_mint === "So11111111111111111111111111111111111111112" || args.output_mint === "SOL" ? "SOL" : args.output_mint?.slice(0, 8), amountIn: result.amount_in, amountOut: result.amount_out, tx: result.tx }).catch(() => {});
       } else if (name === "deploy_position") {
-        notifyDeploy({ pair: result.pool_name || args.pool_name || args.pool_address?.slice(0, 8), amountSol: args.amount_y ?? args.amount_sol ?? 0, position: result.position, tx: result.txs?.[0] ?? result.tx, priceRange: result.price_range, rangeCoverage: result.range_coverage, binStep: result.bin_step, baseFee: result.base_fee }).catch(() => {});
+        notifyDeploy({ pair: result.pool_name || args.pool_name || args.pool_address?.slice(0, 8), amountSol: args.amount_y ?? args.amount_sol ?? 0, quoteSymbol: result.quote_symbol || "SOL", position: result.position, tx: result.txs?.[0] ?? result.tx, priceRange: result.price_range, rangeCoverage: result.range_coverage, binStep: result.bin_step, baseFee: result.base_fee }).catch(() => {});
       } else if (name === "close_position") {
         notifyClose({ pair: result.pool_name || args.position_address?.slice(0, 8), pnlUsd: result.pnl_usd ?? 0, pnlPct: result.pnl_pct ?? 0 }).catch(() => {});
         // Note low-yield closes in pool memory so screener avoids redeploying
@@ -759,16 +779,20 @@ export async function executeTool(name, args) {
         }
         // Auto-swap base token back to SOL unless user said to hold (retried).
         if (!args.skip_swap && result.base_mint) {
-          const { swapped, result: swapResult } = await swapBaseToSolWithRetry(result.base_mint, "after close");
+          const target = getSwapTargetForPosition(args.position_address);
+          const { swapped, result: swapResult } = await swapBaseToSolWithRetry(result.base_mint, "after close", target);
           if (swapped) {
             // Tell the model the swap already happened so it doesn't call swap_token again
             result.auto_swapped = true;
-            result.auto_swap_note = `Base token already auto-swapped back to SOL (${result.base_mint.slice(0, 8)} → SOL). Do NOT call swap_token again.`;
-            if (swapResult?.amount_out) result.sol_received = swapResult.amount_out;
+            result.auto_swap_note = `Base token already auto-swapped to ${target.symbol} (${result.base_mint.slice(0, 8)} → ${target.symbol}). Do NOT call swap_token again.`;
+            if (swapResult?.amount_out) {
+              if (target.symbol === "SOL") result.sol_received = swapResult.amount_out;
+              else result.usdc_received = swapResult.amount_out;
+            }
           }
         }
       } else if (name === "claim_fees" && config.management.autoSwapAfterClaim && result.base_mint) {
-        await swapBaseToSolWithRetry(result.base_mint, "after claim");
+        await swapBaseToSolWithRetry(result.base_mint, "after claim", getSwapTargetForPosition(args.position_address));
       }
     }
 
@@ -911,11 +935,36 @@ async function runSafetyChecks(name, args) {
 
       // Check amount limits
       const amountY = deployAmountY;
+      const quoteIsUsdc = poolThresholds.quoteMint === config.tokens.USDC;
+      const unit = quoteIsUsdc ? "USDC" : "SOL";
       if (!Number.isFinite(amountY) || amountY <= 0) {
         return {
           pass: false,
-          reason: `Must provide a positive SOL amount (amount_y).`,
+          reason: `Must provide a positive ${unit} amount (amount_y).`,
         };
+      }
+
+      if (quoteIsUsdc) {
+        // USDC pools: wallet USDC only (never swapped from SOL); gas still paid in SOL.
+        const minUsdc = Number(config.management.minDeployUsdc) || 0;
+        if (amountY < minUsdc) {
+          return { pass: false, reason: `Amount ${amountY} USDC is below minDeployUsdc (${minUsdc} USDC).` };
+        }
+        const balance = await getWalletBalances(); // Helius — deploy path
+        const maxUsdc = config.risk.maxDeployAmount * (Number(balance.sol_price) || 0);
+        if (maxUsdc > 0 && amountY > maxUsdc) {
+          return { pass: false, reason: `USDC amount ${amountY} exceeds the per-position maximum (${config.risk.maxDeployAmount} SOL ≈ ${maxUsdc.toFixed(2)} USDC).` };
+        }
+        if (process.env.DRY_RUN !== "true") {
+          if ((Number(balance.usdc) || 0) < amountY) {
+            return { pass: false, reason: `Insufficient USDC: have ${balance.usdc} USDC, need ${amountY} USDC. USDC deploys use wallet USDC only.` };
+          }
+          const gasReserve = config.management.gasReserve;
+          if (balance.sol < gasReserve) {
+            return { pass: false, reason: `Insufficient SOL for gas: have ${balance.sol} SOL, need ${gasReserve} SOL.` };
+          }
+        }
+        return { pass: true };
       }
 
       const minDeploy = Math.max(0.1, config.management.deployAmountSol);

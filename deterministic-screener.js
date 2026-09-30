@@ -122,7 +122,7 @@ function fmtNum(value, digits = 0) {
 }
 
 /** Telegram-friendly DEPLOYED report built from the ranked winner + deploy result. */
-export function buildDeployedReport({ winner, runnerUp, result, deployAmount }) {
+export function buildDeployedReport({ winner, runnerUp, result, deployAmount, quoteSymbol = "SOL" }) {
   const { pool, sw, ti } = winner;
   const cov = result?.range_coverage || {};
   const range = result?.price_range;
@@ -134,7 +134,7 @@ export function buildDeployedReport({ winner, runnerUp, result, deployAmount }) 
     pool.name,
     pool.pool,
     "",
-    `◎ ${deployAmount} SOL | ${result?.strategy || wouldDeploy?.strategy || config.strategy.strategy} | bin ${result?.bin_range?.active ?? "?"}`,
+    `${quoteSymbol === "SOL" ? "◎" : "$"} ${deployAmount} ${quoteSymbol} | ${result?.strategy || wouldDeploy?.strategy || config.strategy.strategy} | bin ${result?.bin_range?.active ?? "?"}`,
     range ? `Range: ${range.min} → ${range.max}` : null,
     cov.downside_pct != null
       ? `Range cover: ${fmtPct(cov.downside_pct)} downside | ${fmtPct(cov.upside_pct)} upside | ${fmtPct(cov.width_pct)} total`

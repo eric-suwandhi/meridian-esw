@@ -320,7 +320,8 @@ All persistent files are loaded/saved on each call — no in-memory caching laye
 | `OPENROUTER_API_KEY` (or `LLM_API_KEY`) | yes | LLM provider key. |
 | `LLM_BASE_URL` | no | Override for any OpenAI-compatible endpoint (LM Studio: `http://localhost:1234/v1`). |
 | `LLM_MODEL` | no | Default model. Per-role models in `user-config.json` override. |
-| `HELIUS_API_KEY` | recommended | Wallet balance lookups via Helius. |
+| `HELIUS_API_KEY` | recommended | Helius wallet API for screening/deploy balance checks; also builds the keyed fallback RPC for reporting reads when `RPC_URL` is unset. |
+| `READ_RPC_URL` | no | Free RPC for reporting balance reads (same as `readRpcUrl`; default `https://pump.helius-rpc.com`). |
 | `LPAGENT_API_KEY` | optional | Direct LPAgent positions fetch fallback. |
 | `JUPITER_API_KEY` | optional | Better rate limit on Jupiter Swap. Default key baked in. |
 | `TELEGRAM_BOT_TOKEN` | no | Notifications + REPL. |
@@ -434,6 +435,29 @@ Score 0–100 = weighted sub-scores (0–1) + bonus − penalties, clamped. Weig
 - Deploys the best candidate with score ≥ `detMinScore` (50) via `deployScoredCandidate` → `executeTool("deploy_position")` (full safety pipeline). On failure (incl. `blocked`) tries the next qualifying candidate, up to `detMaxDeployAttempts` (2). Otherwise `no_deploy` decision with every candidate's breakdown.
 - Ties: newer token, then higher degen. The lone-candidate rule is skipped (min score replaces it).
 - LLM mode still gets a `det_score …` line per candidate block.
+
+---
+
+## RPC split (`tools/rpc.js`)
+
+| Area | RPC |
+|---|---|
+| Screening (pre-check balance, sizing, active bin, smart wallets, opportunity poller), deploy / close / claim / swap and their safety checks | `RPC_URL` + Helius wallet API (`getWalletBalances()` default `source: "helius"`) |
+| Position PnL (management cycle, PnL poller) | `pnlRpcUrl` (free `pump.helius-rpc.com`) |
+| Reporting balances: health check, `/status`, `/wallet`, terminal `/status`, CLI `balance`, LLM chat context | `getWalletBalances({ source: "free" })` → `readRpcUrl` (default `pump.helius-rpc.com`) via `withReadFallback`, falling back to keyed Helius (`RPC_URL`, else `mainnet.helius-rpc.com/?api-key=HELIUS_API_KEY`), then the Helius wallet API |
+
+Don't switch a screening / deploy / close path to `source: "free"`.
+
+---
+
+## USDC-pair support
+
+- `allowedQuoteMints` (default SOL + USDC) is enforced in `getTopCandidates`, `validateDeployPoolThresholds`, `deployPosition` and `computeDeployAmountForQuote`. `/settings` → Screen → "USDC pools" toggles it.
+- Deposits are single-sided in the pool's **quote** token. `computeDeployAmountForQuote(quoteMint, wallet)` (`config.js`) sizes SOL pools as before; USDC pools use **wallet USDC only** (never swapped from SOL): `deployAmountUsdc`, or the SOL deploy amount × SOL price when 0, capped at wallet USDC, skipped below `minDeployUsdc` (10).
+- `index.js sizeCandidateDeploy` runs in the post-recon filter (sets `entry.deploy`) and in `deployLatestCandidate`; `hasDeployableFunds` lets screening run on USDC + gas SOL.
+- `deployPosition` converts `amount_y` with the quote mint's decimals (`quoteAmountToBaseUnits`; USDC 6, not the old hard-coded 1e9), skips the SOL-only LPAgent relay for USDC, and tracks `quote_mint` / `quote_symbol` / `amount_y`. `amount_sol` holds the SOL-equivalent for USDC positions (keeps the lessons unit-mix guard valid).
+- PnL (`pnl.js buildPosition`) values the quote side at its own Jupiter price; a missing quote price marks the tick suspicious.
+- After close/claim, the base token is auto-swapped into the position's quote (`getSwapTargetForPosition`) — USDC pools keep USDC.
 
 ---
 

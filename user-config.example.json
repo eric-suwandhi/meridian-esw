@@ -94,6 +94,14 @@
   "gmgnFeeSource": "gmgn",
   "gmgnApiKey": "",
 
+  "readRpcUrl": "https://pump.helius-rpc.com",
+  "allowedQuoteMints": [
+    "So11111111111111111111111111111111111111112",
+    "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"
+  ],
+  "deployAmountUsdc": 0,
+  "minDeployUsdc": 10,
+
   "screeningMode": "deterministic",
   "detMinScore": 50,
   "detFreshAgeHours": 72,

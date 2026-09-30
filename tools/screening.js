@@ -628,6 +628,12 @@ export async function getTopCandidates({ limit = 10 } = {}) {
         pushFilteredReason(filteredOut, p, `volatility ${p.volatility ?? "unknown"} is unusable`);
         return false;
       }
+      const quoteMint = p.quote?.mint ?? p.token_y?.address ?? null;
+      const allowedQuotes = config.screening.allowedQuoteMints;
+      if (Array.isArray(allowedQuotes) && allowedQuotes.length > 0 && !allowedQuotes.includes(quoteMint)) {
+        pushFilteredReason(filteredOut, p, `quote ${p.quote?.symbol || quoteMint || "unknown"} not supported`);
+        return false;
+      }
       const epReject = getEvilPandaPoolRejectReason(p);
       if (epReject) {
         pushFilteredReason(filteredOut, p, epReject);

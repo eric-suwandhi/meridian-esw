@@ -50,6 +50,9 @@ const indicatorUserConfig = u.chartIndicators ?? {};
 // defaults unless the user set those keys explicitly.
 const evilPandaEnabled = u.evilPandaEnabled ?? true;
 
+export const SOL_MINT = "So11111111111111111111111111111111111111112";
+export const USDC_MINT = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v";
+
 // Optional standalone GMGN config file (mirrors user-config layering)
 const GMGN_CONFIG_PATH = repoPath("gmgn-config.json");
 const gmgnUserConfig = fs.existsSync(GMGN_CONFIG_PATH)
@@ -105,6 +108,8 @@ export const config = {
     detFreshAgeHours:     Number(u.detFreshAgeHours ?? 72),    // token age where the freshness sub-score hits 0
     detMaxDeployAttempts: Number(u.detMaxDeployAttempts ?? 2), // qualifying candidates to try if a deploy fails
     detScoreWeights:      u.detScoreWeights && typeof u.detScoreWeights === "object" ? u.detScoreWeights : {},
+    // Quote tokens the bot may LP against (single-sided in the quote). Others are filtered out.
+    allowedQuoteMints:    Array.isArray(u.allowedQuoteMints) ? u.allowedQuoteMints : [SOL_MINT, USDC_MINT],
     allowedLaunchpads: u.allowedLaunchpads ?? [],  // allow-list launchpads, [] = no allow-list
     blockedLaunchpads:  u.blockedLaunchpads  ?? [],  // e.g. ["letsbonk.fun", "pump.fun"]
     minTokenAgeHours:   u.minTokenAgeHours   ?? null, // null = no minimum
@@ -133,6 +138,9 @@ export const config = {
     minAgeBeforeYieldCheck: u.minAgeBeforeYieldCheck ?? 60, // minutes before low yield can trigger close
     minSolToOpen:          u.minSolToOpen          ?? 0.55,
     deployAmountSol:       u.deployAmountSol       ?? 0.5,
+    // USDC-pair deploys use wallet USDC only. 0 = same USD value as the SOL deploy amount.
+    deployAmountUsdc:      Number(u.deployAmountUsdc ?? 0),
+    minDeployUsdc:         Number(u.minDeployUsdc ?? 10),  // skip USDC pools below this
     gasReserve:            u.gasReserve            ?? 0.2,
     positionSizePct:       u.positionSizePct       ?? 0.35,
     // Trailing take-profit
@@ -183,8 +191,8 @@ export const config = {
 
   // ─── Common Token Mints ────────────────
   tokens: {
-    SOL:  "So11111111111111111111111111111111111111112",
-    USDC: "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v",
+    SOL:  SOL_MINT,
+    USDC: USDC_MINT,
     USDT: "Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB",
   },
 
@@ -200,6 +208,12 @@ export const config = {
     url: nonEmptyString(u.agentMeridianApiUrl, process.env.AGENT_MERIDIAN_API_URL, DEFAULT_AGENT_MERIDIAN_API_URL),
     publicApiKey: nonEmptyString(u.publicApiKey, process.env.PUBLIC_API_KEY, DEFAULT_AGENT_MERIDIAN_PUBLIC_KEY),
     lpAgentRelayEnabled: u.lpAgentRelayEnabled ?? false,
+  },
+
+  // ─── Read-only RPC for management/reporting (health, /status, /wallet) ──
+  // Screening/deploy/close stay on RPC_URL (Helius). Fallback = keyed Helius.
+  rpc: {
+    readUrl: nonEmptyString(u.readRpcUrl, process.env.READ_RPC_URL, "https://pump.helius-rpc.com"),
   },
 
   // ─── PnL fetcher / poller (public infra: RPC + Meteora deposits + Jupiter) ──
@@ -319,6 +333,46 @@ export function computeDeployAmount(walletSol) {
   const dynamic    = deployable * pct;
   const result     = Math.min(ceil, Math.max(floor, dynamic));
   return parseFloat(result.toFixed(2));
+}
+
+export function quoteSymbolForMint(mint) {
+  if (mint === SOL_MINT) return "SOL";
+  if (mint === USDC_MINT) return "USDC";
+  return mint ? `${String(mint).slice(0, 4)}…` : "?";
+}
+
+/**
+ * Deploy amount in the pool's quote token (single-sided deposit).
+ *   SOL pools  → computeDeployAmount(wallet.sol), as before.
+ *   USDC pools → wallet USDC only: deployAmountUsdc, or the SOL deploy amount's USD value
+ *                when that is 0; capped at the wallet's USDC; below minDeployUsdc → skip.
+ * @returns {{ amount: number|null, quoteSymbol: string, skipReason: string|null }}
+ */
+export function computeDeployAmountForQuote(quoteMint, wallet = {}) {
+  const quoteSymbol = quoteSymbolForMint(quoteMint);
+  const allowed = config.screening.allowedQuoteMints;
+  if (quoteMint && Array.isArray(allowed) && allowed.length > 0 && !allowed.includes(quoteMint)) {
+    return { amount: null, quoteSymbol, skipReason: `${quoteSymbol} pools are disabled (allowedQuoteMints)` };
+  }
+  if (!quoteMint || quoteMint === SOL_MINT) {
+    return { amount: computeDeployAmount(Number(wallet.sol) || 0), quoteSymbol: "SOL", skipReason: null };
+  }
+  if (quoteMint !== USDC_MINT) {
+    return { amount: null, quoteSymbol, skipReason: `quote ${quoteSymbol} not supported` };
+  }
+  const fixed = Number(config.management.deployAmountUsdc) || 0;
+  const solPrice = Number(wallet.sol_price) || 0;
+  if (fixed <= 0 && solPrice <= 0) {
+    return { amount: null, quoteSymbol, skipReason: "no SOL price to size the USDC deploy" };
+  }
+  const target = fixed > 0 ? fixed : computeDeployAmount(Number(wallet.sol) || 0) * solPrice;
+  const usdc = Number(wallet.usdc) || 0;
+  const amount = Math.floor(Math.min(target, usdc) * 100) / 100;
+  const min = Number(config.management.minDeployUsdc) || 0;
+  if (amount < min) {
+    return { amount: null, quoteSymbol, skipReason: `not enough USDC (have ${usdc.toFixed(2)}, need ≥ ${min})` };
+  }
+  return { amount, quoteSymbol, skipReason: null };
 }
 
 /**

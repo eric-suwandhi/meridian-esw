@@ -49,7 +49,7 @@ export function buildHealthReport({ wallet, positions, performance = null, getTr
   const lines = [
     "🩺 Health Check",
     "",
-    `Wallet: ${num(wallet?.sol)?.toFixed(3) ?? "?"} SOL${wallet?.sol_usd != null ? ` ($${wallet.sol_usd})` : ""}`,
+    `Wallet: ${num(wallet?.sol)?.toFixed(3) ?? "?"} SOL${wallet?.sol_usd != null ? ` ($${wallet.sol_usd})` : ""}${num(wallet?.usdc) > 0 ? ` | ${num(wallet.usdc).toFixed(2)} USDC` : ""}`,
     `Positions: ${positions?.total_positions ?? list.length}/${config.risk.maxPositions}`,
   ];
 

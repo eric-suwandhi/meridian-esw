@@ -8,7 +8,7 @@ import { log } from "./logger.js";
 import { getMyPositions, closePosition, getActiveBin } from "./tools/dlmm.js";
 import { getWalletBalances } from "./tools/wallet.js";
 import { getTopCandidates, degenScore } from "./tools/screening.js";
-import { config, reloadScreeningThresholds, computeDeployAmount } from "./config.js";
+import { config, reloadScreeningThresholds, computeDeployAmount, computeDeployAmountForQuote } from "./config.js";
 import { evolveThresholds, getPerformanceSummary } from "./lessons.js";
 import { executeTool, registerCronRestarter } from "./tools/executor.js";
 import {
@@ -389,14 +389,15 @@ export async function runScreeningCycle({ silent = false } = {}) {
     }
     const minRequired = config.management.deployAmountSol + config.management.gasReserve;
     const isDryRun = process.env.DRY_RUN === "true";
-    if (!isDryRun && preBalance.sol < minRequired) {
-      log("cron", `Screening skipped — insufficient SOL (${preBalance.sol.toFixed(3)} < ${minRequired} needed for deploy + gas)`);
-      screenReport = `Screening skipped — insufficient SOL (${preBalance.sol.toFixed(3)} < ${minRequired} needed for deploy + gas).`;
+    if (!isDryRun && !hasDeployableFunds(preBalance)) {
+      const usdcNote = usdcPoolsAllowed() ? ` and USDC ${Number(preBalance.usdc || 0).toFixed(2)} < ${config.management.minDeployUsdc}` : "";
+      log("cron", `Screening skipped — insufficient funds (SOL ${preBalance.sol.toFixed(3)} < ${minRequired} needed for deploy + gas${usdcNote})`);
+      screenReport = `Screening skipped — insufficient funds (SOL ${preBalance.sol.toFixed(3)} < ${minRequired} needed for deploy + gas${usdcNote}).`;
       appendDecision({
         type: "skip",
         actor: "SCREENER",
         summary: "Screening skipped",
-        reason: `Insufficient SOL (${preBalance.sol.toFixed(3)} < ${minRequired})`,
+        reason: `Insufficient funds (SOL ${preBalance.sol.toFixed(3)} < ${minRequired}${usdcNote})`,
       });
       _screeningBusy = false;
       return screenReport;
@@ -449,7 +450,8 @@ export async function runScreeningCycle({ silent = false } = {}) {
 
     // Hard filters after token recon — block launchpads and excessive Jupiter bot holders
     const filteredOut = [];
-    const passing = allCandidates.filter(({ pool, ti }) => {
+    const passing = allCandidates.filter((entry) => {
+      const { pool, ti } = entry;
       const launchpad = ti?.launchpad ?? null;
       if (launchpad && config.screening.allowedLaunchpads?.length > 0 && !config.screening.allowedLaunchpads.includes(launchpad)) {
         log("screening", `Skipping ${pool.name} — launchpad ${launchpad} not in allow-list`);
@@ -476,6 +478,14 @@ export async function runScreeningCycle({ silent = false } = {}) {
         filteredOut.push({ name: pool.name, reason: epReason });
         return false;
       }
+      // Size the deploy in the pool's quote token (SOL, or wallet USDC for USDC pools).
+      const sized = sizeCandidateDeploy(pool, currentBalance);
+      if (sized.skipReason) {
+        log("screening", `Funds filter: dropped ${pool.name} — ${sized.skipReason}`);
+        filteredOut.push({ name: pool.name, reason: sized.skipReason });
+        return false;
+      }
+      entry.deploy = sized;
       return true;
     });
 
@@ -540,7 +550,7 @@ export async function runScreeningCycle({ silent = false } = {}) {
     );
 
     // Build compact candidate blocks
-    const candidateBlocks = passing.map(({ pool, sw, n, ti, mem }, i) => {
+    const candidateBlocks = passing.map(({ pool, sw, n, ti, mem, deploy }, i) => {
       const botPct = ti?.audit?.bot_holders_pct ?? "?";
       const top10Pct = ti?.audit?.top_holders_pct ?? "?";
       const feesSol = ti?.global_fees_sol ?? "?";
@@ -555,6 +565,7 @@ export async function runScreeningCycle({ silent = false } = {}) {
 
       const block = [
         `POOL: ${pool.name} (${pool.pool})`,
+        deploy ? `  deploy_amount: amount_y=${deploy.amount} ${deploy.quoteSymbol} (quote token; pass exactly this)` : null,
         `  metrics: bin_step=${pool.bin_step}, fee_pct=${pool.fee_pct}%, fee_tvl=${pool.fee_active_tvl_ratio}, vol=$${pool.volume_window}, tvl=$${pool.tvl ?? pool.active_tvl}, volatility_${pool.volatility_timeframe || "30m"}=${pool.volatility}, mcap=$${pool.mcap}, organic=${pool.organic_score}${pool.token_age_hours != null ? `, age=${pool.token_age_hours}h` : ""}`,
         `  audit: top10=${top10Pct}%, bots=${botPct}%, fees=${feesSol}SOL${ti?.volume_24h != null ? `, vol24h=$${ti.volume_24h}` : ""}${launchpad ? `, launchpad=${launchpad}` : ""}`,
         pvpLine,
@@ -593,7 +604,7 @@ ${isEvilPandaEnabled()
   : `   bins_below = round(${config.strategy.minBinsBelow} + (candidate volatility/5)*(${config.strategy.maxBinsBelow - config.strategy.minBinsBelow})) clamped to [${config.strategy.minBinsBelow},${config.strategy.maxBinsBelow}].`}
    pass deploy_position.volatility = the candidate volatility value.
    For single-side SOL deploys, do not invent upside:
-   set amount_y only, keep amount_x = 0, keep bins_above = 0, and let the upper bin stay at the active bin.
+   set amount_y only (use the candidate's deploy_amount — it is in that pool's quote token, SOL or USDC), keep amount_x = 0, keep bins_above = 0, and let the upper bin stay at the active bin.
 4. Report in this exact format (no tables, no extra sections):
    🚀 DEPLOYED
 
@@ -701,7 +712,7 @@ export function startCronJobs() {
   // Hourly health report — built in code, read-only (no LLM, cannot act on positions).
   const healthTask = cron.schedule(`0 * * * *`, async () => {
     try {
-      const [wallet, positions] = await Promise.all([getWalletBalances(), getMyPositions({ force: true, silent: true })]);
+      const [wallet, positions] = await Promise.all([getWalletBalances({ source: "free" }), getMyPositions({ force: true, silent: true })]);
       const report = buildHealthReport({
         wallet,
         positions,
@@ -794,8 +805,7 @@ export function startCronJobs() {
           getWalletBalances().catch(() => null),
         ]);
         if (!positions || (positions.total_positions ?? 0) >= config.risk.maxPositions) return;
-        const minRequired = config.management.deployAmountSol + config.management.gasReserve;
-        if (process.env.DRY_RUN !== "true" && (!balance || balance.sol < minRequired)) return;
+        if (process.env.DRY_RUN !== "true" && (!balance || !hasDeployableFunds(balance))) return;
 
         const top = await getTopCandidates({ limit: config.opportunity.limit }).catch(() => null);
         const candidates = (top?.candidates || []).slice().sort((a, b) => degenScore(b, config.opportunity) - degenScore(a, config.opportunity));
@@ -915,7 +925,7 @@ function getDeterministicCloseRule(position, managementConfig) {
     if (position.pnl_pct_suspicious) return true;
     if (position.pnl_pct == null) return false;
     if (position.pnl_pct > -90) return false;
-    if (tracked?.amount_sol && (position.total_value_usd ?? 0) > 0.01) {
+    if ((tracked?.amount_sol || tracked?.amount_y) && (position.total_value_usd ?? 0) > 0.01) {
       log("cron_warn", `Suspect PnL for ${position.pair}: ${position.pnl_pct}% but position still has value — skipping PnL rules`);
       return true;
     }
@@ -1071,6 +1081,7 @@ function settingValue(key) {
     requireAllIntervals: config.indicators.requireAllIntervals,
     screeningMode: config.screening.screeningMode,
     detMinScore: config.screening.detMinScore,
+    usdcPools: usdcPoolsAllowed(),
   };
   return values[key];
 }
@@ -1152,6 +1163,7 @@ function renderSettingsMenu(page = "main") {
         settingButton(`${config.screening.screeningMode === "llm" ? "✅ " : ""}Pick: LLM`, "cfg:set:screeningMode:llm"),
       ],
       stepButtons("detMinScore", "Min score", 5, { digits: 0 }),
+      [toggleButton("usdcPools", "USDC pools")],
       [
         settingButton(`Strategy: spot`, "cfg:set:strategy:spot"),
         settingButton(`Strategy: bid_ask`, "cfg:set:strategy:bid_ask"),
@@ -1271,8 +1283,12 @@ async function applySettingsMenuCallback(msg) {
     return;
   }
 
+  // "usdcPools" is a menu-only alias for allowedQuoteMints.
+  const changes = key === "usdcPools"
+    ? { allowedQuoteMints: value ? [config.tokens.SOL, config.tokens.USDC] : [config.tokens.SOL] }
+    : { [key]: value };
   const result = await executeTool("update_config", {
-    changes: { [key]: value },
+    changes,
     reason: "Telegram settings menu",
   });
   if (!result?.success) {
@@ -1281,7 +1297,7 @@ async function applySettingsMenuCallback(msg) {
   }
   page = key.startsWith("indicator") || key === "chartIndicatorsEnabled" || key === "rsiLength" || key === "requireAllIntervals"
     ? "indicators"
-    : ["useDiscordSignals", "blockPvpSymbols", "screeningMode", "detMinScore", "strategy", "minBinsBelow", "maxBinsBelow", "defaultBinsBelow", "managementIntervalMin", "screeningIntervalMin"].includes(key)
+    : ["useDiscordSignals", "blockPvpSymbols", "screeningMode", "detMinScore", "usdcPools", "strategy", "minBinsBelow", "maxBinsBelow", "defaultBinsBelow", "managementIntervalMin", "screeningIntervalMin"].includes(key)
       ? "screen"
       : "risk";
   await answerCallbackQuery(msg.callbackQueryId, `Updated ${key}`);
@@ -1382,10 +1398,11 @@ async function deployLatestCandidate(index) {
       throw new Error(`NO DEPLOY: only cached candidate ${candidate.name} is not worth deploying — ${skipReason}`);
     }
   }
-  const deployAmount = computeDeployAmount((await getWalletBalances()).sol);
-  const { ok, result, error, binsBelow } = await deployScoredCandidate(candidate, deployAmount);
+  const sized = sizeCandidateDeploy(candidate, await getWalletBalances());
+  if (sized.skipReason) throw new Error(`NO DEPLOY: ${candidate.name} — ${sized.skipReason}`);
+  const { ok, result, error, binsBelow } = await deployScoredCandidate(candidate, sized);
   if (!ok) throw new Error(error);
-  return { result, candidate, deployAmount, binsBelow };
+  return { result, candidate, deployAmount: sized.amount, quoteSymbol: sized.quoteSymbol, binsBelow };
 }
 
 function appendHistory(userMsg, assistantMsg) {
@@ -1452,7 +1469,7 @@ async function telegramHandler(msg) {
 
   if (text === "/wallet" || text === "/status") {
     try {
-      const [wallet, positions] = await Promise.all([getWalletBalances(), getMyPositions({ force: true })]);
+      const [wallet, positions] = await Promise.all([getWalletBalances({ source: "free" }), getMyPositions({ force: true })]);
       const suffix = text === "/status" && positions.total_positions
         ? `\n\nUse /positions for the numbered list.`
         : "";
@@ -1600,14 +1617,14 @@ async function telegramHandler(msg) {
   if (deployMatch) {
     try {
       const idx = parseInt(deployMatch[1]) - 1;
-      const { candidate, result, deployAmount, binsBelow } = await deployLatestCandidate(idx);
+      const { candidate, result, deployAmount, quoteSymbol, binsBelow } = await deployLatestCandidate(idx);
       const coverage = result.range_coverage
         ? `Range: ${fmtPct(result.range_coverage.downside_pct)} downside | ${fmtPct(result.range_coverage.upside_pct)} upside`
         : `Strategy: ${config.strategy.strategy} | binsBelow: ${binsBelow}`;
       await sendMessage([
         `✅ Deployed ${candidate.name}`,
         `Pool: ${candidate.pool}`,
-        `Amount: ${deployAmount} SOL`,
+        `Amount: ${deployAmount} ${quoteSymbol || "SOL"}`,
         coverage,
         `Position: ${result.position || "n/a"}`,
         result.txs?.length ? `Tx: ${result.txs[0]}` : null,
@@ -1701,6 +1718,37 @@ function fmtPct(value) {
   return Number.isFinite(n) ? `${n.toFixed(2)}%` : "?";
 }
 
+function usdcPoolsAllowed() {
+  return Array.isArray(config.screening.allowedQuoteMints) && config.screening.allowedQuoteMints.includes(config.tokens.USDC);
+}
+
+/** Enough to open something: a SOL deploy + gas, or (USDC pools on) min USDC + gas SOL. */
+function hasDeployableFunds(balance) {
+  const gas = config.management.gasReserve;
+  if (balance.sol >= config.management.deployAmountSol + gas) return true;
+  return usdcPoolsAllowed() && balance.sol >= gas && (Number(balance.usdc) || 0) >= config.management.minDeployUsdc;
+}
+
+/**
+ * Per-candidate deploy amount in the pool's quote token, or a skip reason.
+ * SOL pools also need the SOL amount + gas in the wallet (not checked in DRY_RUN).
+ */
+function sizeCandidateDeploy(pool, balance) {
+  const quoteMint = pool.quote?.mint ?? pool.quote_mint ?? config.tokens.SOL;
+  const sized = computeDeployAmountForQuote(quoteMint, balance);
+  if (sized.skipReason) return sized;
+  if (quoteMint === config.tokens.SOL && process.env.DRY_RUN !== "true") {
+    const need = sized.amount + config.management.gasReserve;
+    if (balance.sol < need) return { ...sized, amount: null, skipReason: `not enough SOL (have ${balance.sol}, need ${need})` };
+  }
+  const solPrice = Number(balance.sol_price) || 0;
+  return {
+    ...sized,
+    quoteMint,
+    amountSolEquiv: quoteMint === config.tokens.SOL ? sized.amount : (solPrice > 0 ? Math.round((sized.amount / solPrice) * 1e4) / 1e4 : null),
+  };
+}
+
 function stageCandidateSignals({ pool, sw, n, ti }) {
   const baseMint = pool.base?.mint || pool.base_mint || ti?.mint || null;
   stageSignals(pool.pool, {
@@ -1720,7 +1768,8 @@ function stageCandidateSignals({ pool, sw, n, ti }) {
  * Deploy one candidate through the executeTool safety pipeline.
  * Returns { ok, result, error, binsBelow } — a safety block counts as a failure.
  */
-async function deployScoredCandidate(candidate, deployAmount) {
+async function deployScoredCandidate(candidate, sized) {
+  const deployAmount = sized.amount;
   // EP mode forces the -X% range in runSafetyChecks/deployPosition; bins_below is ignored there.
   const binsBelow = isEvilPandaEnabled() ? undefined : computeBinsBelow(candidate.volatility);
   const result = await executeTool("deploy_position", {
@@ -1737,6 +1786,7 @@ async function deployScoredCandidate(candidate, deployAmount) {
     fee_tvl_ratio: candidate.fee_active_tvl_ratio ?? candidate.fee_tvl_ratio,
     organic_score: candidate.organic_score,
     initial_value_usd: candidate.tvl ?? candidate.active_tvl ?? null,
+    amount_sol_equiv: sized.amountSolEquiv ?? null,
   });
   const failed = !result || result.success === false || !!result.error || !!result.blocked;
   return {
@@ -1766,7 +1816,7 @@ async function runDeterministicDeploy({ passing, deployAmount, liveMessage }) {
     await liveMessage?.toolStart("deploy_position");
     let outcome;
     try {
-      outcome = await deployScoredCandidate(cand.pool, deployAmount);
+      outcome = await deployScoredCandidate(cand.pool, cand.deploy ?? { amount: deployAmount, quoteSymbol: "SOL" });
     } catch (error) {
       outcome = { ok: false, error: error.message, result: { error: error.message } };
     }
@@ -1774,7 +1824,13 @@ async function runDeterministicDeploy({ passing, deployAmount, liveMessage }) {
     if (outcome.ok) {
       log("screening", `Deterministic deploy: ${cand.pool.name} — ${formatScoreBreakdown(cand)}`);
       const runnerUp = ranked.find((c) => c !== cand) || null;
-      return buildDeployedReport({ winner: cand, runnerUp, result: outcome.result, deployAmount });
+      return buildDeployedReport({
+        winner: cand,
+        runnerUp,
+        result: outcome.result,
+        deployAmount: cand.deploy?.amount ?? deployAmount,
+        quoteSymbol: cand.deploy?.quoteSymbol ?? "SOL",
+      });
     }
     log("screening", `Deterministic deploy failed for ${cand.pool.name}: ${outcome.error}`);
     failures.push({ pool: cand.pool.pool, error: outcome.error });
@@ -1989,7 +2045,7 @@ Commands:
 
     if (input === "/status") {
       await runBusy(async () => {
-        const [wallet, positions] = await Promise.all([getWalletBalances(), getMyPositions({ force: true })]);
+        const [wallet, positions] = await Promise.all([getWalletBalances({ source: "free" }), getMyPositions({ force: true })]);
         console.log(`\nWallet: ${wallet.sol} SOL  ($${wallet.sol_usd})`);
         console.log(`Positions: ${positions.total_positions}`);
         for (const p of positions.positions) {
